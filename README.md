@@ -33,7 +33,7 @@ Regarding compatibility, I haven't tested any world map altering addons other th
 Drakensangs
 
 ## 📜 **Credits**
- - addon inspired by [**WDM**](https://github.com/Trimitor/WDM-patch) & [**SimpleDungeonMaps**](https://www.curseforge.com/wow/addons/simpledungeonmap)
+ - addon inspired by [**WDM**](https://github.com/Trimitor/WDM-patch) & [**SimpleDungeonMap**](https://www.curseforge.com/wow/addons/simpledungeonmap)
  - dungeon & raid maps from [**WDM**](https://github.com/Trimitor/WDM-patch) & a few map tiles from TurtleWoW
  - party/raid member blips & quest, loot, object marker assets from [**ShaguTweaks**](https://github.com/shagu/ShaguTweaks)
  - boss marker asset from [**ModernMapMarkers**](https://github.com/Drakensangs/ModernMapMarkers-Vanilla)
