@@ -1629,6 +1629,7 @@ function DMV_HideFrames()
 	if DMV_PreviewMode then
 		DMV_CurrentDungeon = nil
 		DMV_PreviewMode = false
+		SetMapToCurrentZone()
 	end
 end
 
@@ -2440,6 +2441,15 @@ WorldMapZoneDropDown_Initialize = function()
 			UIDropDownMenu_SetSelectedID(zoneDD, entryID)
 			DMV_HideFrames()
 			DMV_PreviewMode = true
+			-- Switch to the opposite continent so the player arrow has no
+			-- valid position and stays hidden. SetMapToCurrentZone() on
+			-- preview exit restores the correct location.
+			local currentContinent = GetCurrentMapContinent()
+			if currentContinent == 1 then
+				SetMapZoom(2)
+			else
+				SetMapZoom(1)
+			end
 			DMV_SetTextures(folder, 1)
 			if WorldMapFrame:IsVisible() then
 				DMV_ShowFrames()
