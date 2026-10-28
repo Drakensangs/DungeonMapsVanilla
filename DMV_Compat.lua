@@ -558,6 +558,32 @@ local function DMV_ApplyAtlasAutoSelectFix()
 	end
 end
 
+-- pfQuest
+-- pfQuest pins are parented to WorldMapButton and keyed by zone. When DMV
+-- swaps in a dungeon/raid map the zone resolves to nil but pfQuest's
+-- WORLD_MAP_UPDATE handler only hides pins for continent view, not for
+-- instance maps it can't resolve. The pins bleed into the dungeon overlay.
+-- Fix: hide all pfMap worldmap pins on DMV open, restore on DMV close.
+local function DMV_ApplypfQuestCompat()
+	if not pfMap or not pfMap.pins then return end
+
+	local origShow = DMV_ShowFrames
+	DMV_ShowFrames = function(...)
+		for i = 1, table.getn(pfMap.pins) do
+			if pfMap.pins[i] then pfMap.pins[i]:Hide() end
+		end
+		return origShow(...)
+	end
+
+	local origHide = DMV_HideFrames
+	DMV_HideFrames = function(...)
+		local result = origHide(...)
+		-- Trigger pfQuest to re-evaluate and redraw pins for the current zone.
+		if pfMap.UpdateNodes then pfMap:UpdateNodes() end
+		return result
+	end
+end
+
 -- Atlas strata
 -- AtlasFrame is raised to FULLSCREEN_DIALOG (toplevel) in DMV_OpenAtlasBoss,
 -- placing it above pins and Magnify's WorldMapFrameAreaFrame while leaving
@@ -575,4 +601,5 @@ compatFrame:SetScript("OnEvent", function()
 	DMV_ApplyMMMCompat()
 	DMV_ApplypfUICompat()
 	DMV_ApplyCoordCompat()
+	DMV_ApplypfQuestCompat()
 end)
