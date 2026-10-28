@@ -1,7 +1,7 @@
 ## Interface: 11200
 ## Title: DungeonMapsVanilla
 ## Author: Drakensangs
-## Version: 1.1
+## Version: 1.2
 ## Notes: Adds dungeon and raid maps with helpful markers and Atlas support.
 ## Notes-deDE: Fügt Dungeon- und Schlachtzugskarten mit nützlichen Markierungen und Atlas-Unterstützung hinzu.
 ## Notes-esES: Añade mapas de mazmorras e incursiones con marcadores útiles y soporte para Atlas.
