@@ -400,7 +400,7 @@ DMV_Markers = {
 		{ "Oo180794", 55.8, 12.8, 3, "Scholomance", 13, "Dropped by n10503.|nTeaches i21341.|nRequires 280 Tailoring." },
 		{ "Oo177385", 50.2, 25.8, 3, "Scholomance", 0, "Activate to open the door|nto the o176944." },
 		{ "Lo176487", 32.4, 48.6, 2, "Scholomance", 0, "Contains i13451|nfor q5343." },
-		{ "n14695", 35.7, 41.7, 2, "Scholomance", 16, LEVEL .. " 60" },
+		{ "n14695", 35.7, 41.7, 2, "Scholomance", 16, LEVEL .. " 60|nScourge Invasion" },
 		{ "n11622", 31.3, 56.8, 3, "Scholomance", 17, LEVEL .. " 61" },
 		{ "n14516", 35.7, 56.8, 3, "Scholomance", 18, LEVEL .. " 62|nRequires i18746|nto summon." },
 		{ "Lo176944", 47.7, 50.8, 2, "Scholomance", 0, },
