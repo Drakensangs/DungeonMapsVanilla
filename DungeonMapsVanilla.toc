@@ -1,0 +1,24 @@
+## Interface: 11200
+## Title: DungeonMapsVanilla
+## Author: Drakensangs
+## Version: 1.0
+## Notes: Adds dungeon and raid maps with helpful markers and Atlas support.
+## Notes-deDE: Fügt Dungeon- und Schlachtzugskarten mit nützlichen Markierungen und Atlas-Unterstützung hinzu.
+## Notes-esES: Añade mapas de mazmorras e incursiones con marcadores útiles y soporte para Atlas.
+## Notes-frFR: Ajoute des cartes de donjons et de raids avec des marqueurs utiles et le support d'Atlas.
+## Notes-koKR: 유용한 마커와 Atlas 지원이 포함된 던전 및 공격대 지도를 추가합니다.
+## Notes-zhCN: 添加带有实用标记和Atlas支持的副本与团队副本地图。
+## Notes-zhTW: 新增帶有實用標記與Atlas支援的地城及團隊副本地圖。
+## SavedVariablesPerCharacter: DMV_Settings
+## OptionalDeps: Magnify, pfUI
+
+Localization\localization.lua
+Localization\localization.cn.lua [AllowLoadTextLocale zhCN]
+Localization\localization.de.lua [AllowLoadTextLocale deDE]
+Localization\localization.es.lua [AllowLoadTextLocale esES]
+Localization\localization.fr.lua [AllowLoadTextLocale frFR]
+Localization\localization.ko.lua [AllowLoadTextLocale koKR]
+Localization\localization.tw.lua [AllowLoadTextLocale zhTW]
+DungeonData.lua
+DungeonMapsVanilla.lua
+DMV_Compat.lua
