@@ -572,13 +572,20 @@ local function DMV_ApplypfQuestCompat()
 		for i = 1, table.getn(pfMap.pins) do
 			if pfMap.pins[i] then pfMap.pins[i]:Hide() end
 		end
+		if pfQuest and pfQuest.route and pfQuest.route.drawlayer then
+			pfQuest.route.drawlayer:Hide()
+		end
 		return origShow(...)
 	end
 
 	local origHide = DMV_HideFrames
 	DMV_HideFrames = function(...)
 		local result = origHide(...)
-		-- Trigger pfQuest to re-evaluate and redraw pins for the current zone.
+		-- Re-show the route drawlayer so pfQuest's own WORLD_MAP_UPDATE handler
+		-- can take over. Without this, pfQuest never sees it as needing a restore.
+		if pfQuest and pfQuest.route and pfQuest.route.drawlayer then
+			pfQuest.route.drawlayer:Show()
+		end
 		if pfMap.UpdateNodes then pfMap:UpdateNodes() end
 		return result
 	end
