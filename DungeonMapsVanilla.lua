@@ -4,7 +4,6 @@ local DMV_Frames = {}
 local DMV_Textures = {}
 local DMV_CurrentDungeon = nil
 local DMV_InstanceBrowseMode = nil   -- "dungeon", "raid", or nil
-local DMV_InstanceContinentID = nil  -- selected ID in continent dropdown
 local DMV_InstanceZoneID = nil		 -- selected ID in zone dropdown
 local DMV_CurrentFloor = 1
 local DMV_Initialized = false
@@ -65,6 +64,31 @@ local function GetZoneDropdown()
 	return WorldMapZoneDropdown or WorldMapZoneDropDown
 end
 
+-- Leave instance browse mode (real continent/zone shown in the dropdowns).
+local function DMV_ClearBrowseState()
+	DMV_InstanceBrowseMode = nil
+	DMV_InstanceZoneID = nil
+end
+
+-- Show Dungeons/Raids in the continent dropdown while browsing instances.
+local function DMV_ApplyBrowseModeText(continentDD)
+	if not continentDD then return end
+	if DMV_InstanceBrowseMode == "dungeon" then
+		UIDropDownMenu_SetText(L["Dungeons"], continentDD)
+	elseif DMV_InstanceBrowseMode == "raid" then
+		UIDropDownMenu_SetText(L["Raids"], continentDD)
+	end
+end
+
+-- Select the active instance (DMV_InstanceZoneID) in the zone dropdown.
+local function DMV_ApplyInstanceZoneText(zoneDD, list)
+	local selectedEntry = DMV_InstanceZoneID and list[DMV_InstanceZoneID]
+	if zoneDD and selectedEntry then
+		UIDropDownMenu_SetSelectedID(zoneDD, DMV_InstanceZoneID)
+		UIDropDownMenu_SetText(selectedEntry.name, zoneDD)
+	end
+end
+
 -- Find the map canvas frame
 local function GetMapCanvas()
 	if WorldMapDetailFrame then return WorldMapDetailFrame end
@@ -123,19 +147,19 @@ local function DMV_CreatePlayerArrow()
 	arrow.tex = tex
 	arrow:EnableMouse(true)
 
-	arrow:SetScript("OnEnter", function(self)
-		local x, y = self:GetCenter()
+	arrow:SetScript("OnEnter", function()
+		local x, y = arrow:GetCenter()
 		local parentX = DMV_Container:GetCenter()
 		if x > parentX then
-			WorldMapTooltip:SetOwner(self, "ANCHOR_LEFT")
+			WorldMapTooltip:SetOwner(arrow, "ANCHOR_LEFT")
 		else
-			WorldMapTooltip:SetOwner(self, "ANCHOR_RIGHT")
+			WorldMapTooltip:SetOwner(arrow, "ANCHOR_RIGHT")
 		end
 		WorldMapTooltip:SetText(UnitName("player"))
 		WorldMapTooltip:Show()
 	end)
 
-	arrow:SetScript("OnLeave", function(self)
+	arrow:SetScript("OnLeave", function()
 		WorldMapTooltip:Hide()
 	end)
 
@@ -223,10 +247,10 @@ local function DMV_GetOrCreateBlip(i)
 	blip.tex = tex
 
 	blip:EnableMouse(true)
-	blip:SetScript("OnEnter", function(self)
-		if self.unit then
-			WorldMapTooltip:SetOwner(self, "ANCHOR_RIGHT")
-			WorldMapTooltip:SetText(UnitName(self.unit) or "")
+	blip:SetScript("OnEnter", function()
+		if blip.unit then
+			WorldMapTooltip:SetOwner(blip, "ANCHOR_RIGHT")
+			WorldMapTooltip:SetText(UnitName(blip.unit) or "")
 			WorldMapTooltip:Show()
 		end
 	end)
@@ -395,8 +419,92 @@ function DMV_CreateFrames()
 	clickFrame:EnableMouse(true)
 
 	clickFrame:SetScript("OnMouseDown", function(self, button)
+		button = button or arg1
 		if button == "RightButton" then
-			DMV_HideFrames()
+			local realDungeon = DMV_GetRealDungeon()
+			-- Stage 1: If we are browsing a different map/preview while physically inside a dungeon/raid,
+			-- return to the real active instance and synchronize both Continent and Zone dropdown menus.
+			if realDungeon and DMV_CurrentDungeon ~= realDungeon then
+				local _, _, _, _, _, _, _, instanceMapID = GetInstanceInfo()
+				local floor = (instanceMapID and DMV_LastKnownFloor[instanceMapID]) or DMV_ActualFloor or 1
+				DMV_PreviewMode = false
+				
+				-- Determine if real instance is a raid (entry[3] is true for raids) and sync browse mode
+				local entry = DMV_DungeonByMapID[instanceMapID]
+				local isRaid = entry and entry[3] or false
+				DMV_InstanceBrowseMode = isRaid and "raid" or "dungeon"
+				
+				local list = DMV_BuildInstanceList(isRaid)
+				DMV_InstanceZoneID = nil
+				for i, item in ipairs(list) do
+					if item.mapID == instanceMapID then
+						DMV_InstanceZoneID = i
+						break
+					end
+				end
+
+				DMV_SetTextures(realDungeon, floor)
+				if WorldMapFrame:IsVisible() then
+					DMV_ShowFrames()
+				end
+
+				-- Explicitly fix the Continent dropdown text/selection to match Dungeons or Raids
+				local continentDD = GetContinentDropdown()
+				if continentDD and WorldMapContinentsDropDown_Initialize then
+					UIDropDownMenu_Initialize(continentDD, WorldMapContinentsDropDown_Initialize)
+					local continents = { GetMapContinents() }
+					local targetID = isRaid and (#continents + 2) or (#continents + 1)
+					UIDropDownMenu_SetSelectedID(continentDD, targetID)
+					UIDropDownMenu_SetText(isRaid and L["Raids"] or L["Dungeons"], continentDD)
+				end
+
+				-- Explicitly restore the Zone dropdown text and selection to the real instance
+				local zoneDD = GetZoneDropdown()
+				if zoneDD and DMV_InstanceZoneID then
+					UIDropDownMenu_Initialize(zoneDD, WorldMapZoneDropDown_Initialize)
+					DMV_ApplyInstanceZoneText(zoneDD, list)
+				end
+			else
+				-- Stage 2: If we are already on our actual dungeon map (or outside a dungeon),
+				-- right-clicking clears everything and returns the map to the continent/world view.
+				DMV_HideFrames()
+				DMV_CurrentDungeon = nil
+				DMV_PreviewMode = false
+				DMV_ClearBrowseState()
+				
+				if SetMapToCurrentZone then
+					SetMapToCurrentZone()
+				end
+
+				-- Reset Continent dropdown to the player's current continent
+				local continentDD = GetContinentDropdown()
+				if continentDD and WorldMapContinentsDropDown_Initialize then
+					UIDropDownMenu_Initialize(continentDD, WorldMapContinentsDropDown_Initialize)
+					local continent = GetCurrentMapContinent()
+					if continent and continent > 0 then
+						UIDropDownMenu_SetSelectedID(continentDD, continent)
+						UIDropDownMenu_SetText(select(continent, GetMapContinents()) or "", continentDD)
+					end
+				end
+
+				-- Reset Zone dropdown intelligently based on where the player physically is
+				local zoneDD = GetZoneDropdown()
+				if zoneDD then
+					UIDropDownMenu_Initialize(zoneDD, WorldMapZoneDropDown_Initialize)
+
+					local currentZone = GetCurrentMapZone()
+					if currentZone and currentZone > 0 then
+						-- Player is outside in a real zone: restore current zone selection and text
+						UIDropDownMenu_SetSelectedID(zoneDD, currentZone)
+						UIDropDownMenu_SetText(GetZoneText() or "", zoneDD)
+					else
+						-- Player is inside a dungeon instance: wipe selection and force text blank
+						zoneDD.selectedID = nil
+						UIDropDownMenu_SetSelectedID(zoneDD, 0)
+						UIDropDownMenu_SetText("", zoneDD)
+					end
+				end
+			end
 		elseif button == "LeftButton" then
 			if DMV_CalibMode and DMV_Container then
 				local csc = DMV_Container:GetEffectiveScale()
@@ -665,10 +773,12 @@ local function DMV_UpdateFloorButtonsLive()
 end
 
 -- Called when the player picks an entry from the dropdown.
-function DMV_LevelDropDown_OnClick()
+function DMV_LevelDropDown_OnClick(self)
 	local floors = DMV_CurrentDungeon and DMV_DungeonFloors[DMV_CurrentDungeon]
 	if not floors then return end
-	local idx = this:GetID()
+	local button = self or this
+	if not button then return end
+	local idx = button:GetID()
 	local floorNum = floors[idx]
 	if floorNum then
 		DMV_LevelDropDown_SetFloor(floorNum, idx)
@@ -717,7 +827,7 @@ function DMV_RefreshAreaList()
 			row:SetHighlightTexture(hl)
 			row:SetScript("OnClick", function()
 				local currentFloors = DMV_CurrentDungeon and DMV_DungeonFloors[DMV_CurrentDungeon]
-				local idx = this:GetID()
+				local idx = row:GetID()
 				local floorNum = currentFloors and currentFloors[idx]
 				if floorNum then
 					DMV_HideAreaList()
@@ -839,8 +949,12 @@ function DMV_RefreshMarkerList()
 	end
 end
 
-local function DMV_MarkerRow_OnClick()
-	local item = DMV_MarkerItems[this:GetID()]
+local function DMV_MarkerRow_OnClick(self)
+	-- Classic 1.12's legacy script runner supplies the clicked frame as `this`.
+	-- ClassicAPI's modern positional runner supplies it as `self`. Support both.
+	local button = self or this
+	if not button then return end
+	local item = DMV_MarkerItems[button:GetID()]
 	if not item then return end
 	if not DMV_Settings then DMV_Settings = {} end
 	if item.kind == "allmarkers" then
@@ -1030,8 +1144,10 @@ function DMV_OpenAtlasLootBoss(instanceKey, bossIndex)
 	-- Delay slightly so Atlas finishes its refresh before the loot panel opens.
 	local delayFrame = CreateFrame("Frame")
 	delayFrame.timer = 0
-	delayFrame:SetScript("OnUpdate", function()
-		delayFrame.timer = delayFrame.timer + arg1
+	delayFrame:SetScript("OnUpdate", function(self, elapsed)
+		-- ClassicAPI may expose the OnUpdate delta through legacy arg1.
+		elapsed = tonumber(elapsed) or tonumber(arg1) or 0
+		delayFrame.timer = delayFrame.timer + elapsed
 		if delayFrame.timer >= 0.1 then
 			delayFrame:SetScript("OnUpdate", nil)
 			AtlasLoot_ShowBossLoot(dataID, bossText, AtlasFrame)
@@ -1085,16 +1201,16 @@ local function DMV_CreateBossPin(pinIndex)
 
 	pin.removed = false
 
-	pin:SetScript("OnEnter", function(self)
-		local baseSize = (self.altTexture or self.lootTexture or self.objectTexture) and DMV_BOSS_PIN_SIZE_ALT or DMV_BOSS_PIN_SIZE
+	pin:SetScript("OnEnter", function()
+		local baseSize = (pin.altTexture or pin.lootTexture or pin.objectTexture) and DMV_BOSS_PIN_SIZE_ALT or DMV_BOSS_PIN_SIZE
 		local newSize = baseSize * DMV_BOSS_HOVER_MULT
-		self:SetWidth(newSize)
-		self:SetHeight(newSize)
-		self.highlight:SetAlpha(DMV_BOSS_HOVER_ALPHA)
-		WorldMapTooltip:SetOwner(self, "ANCHOR_RIGHT")
-		WorldMapTooltip:AddLine(self.bossName, 1, 0.82, 0)
-		if self.comment then
-			local filtered = DMV_FilterCommentByFaction(self.comment)
+		pin:SetWidth(newSize)
+		pin:SetHeight(newSize)
+		pin.highlight:SetAlpha(DMV_BOSS_HOVER_ALPHA)
+		WorldMapTooltip:SetOwner(pin, "ANCHOR_RIGHT")
+		WorldMapTooltip:AddLine(pin.bossName, 1, 0.82, 0)
+		if pin.comment then
+			local filtered = DMV_FilterCommentByFaction(pin.comment)
 			if filtered then
 				local resolved = DMV_ResolveCommentItems(filtered)
 				local commentText = "|cff999999" .. string.gsub(resolved, "|r", "|r|cff999999")
@@ -1102,8 +1218,8 @@ local function DMV_CreateBossPin(pinIndex)
 			end
 		end
 		if DMV_CalibMode then
-			WorldMapTooltip:AddLine("AtlasLoot #" .. tostring(self.atlasBossIndex), 0.6, 0.8, 1)
-			if self.removed then
+			WorldMapTooltip:AddLine("AtlasLoot #" .. tostring(pin.atlasBossIndex), 0.6, 0.8, 1)
+			if pin.removed then
 				WorldMapTooltip:AddLine(L["Marker removed"], 1, 0.4, 0.4)
 			else
 				WorldMapTooltip:AddLine(L["Marker move"], 0.7, 0.7, 0.7)
@@ -1113,46 +1229,50 @@ local function DMV_CreateBossPin(pinIndex)
 		end
 		WorldMapTooltip:Show()
 	end)
-	pin:SetScript("OnLeave", function(self)
-		local baseSize = (self.altTexture or self.lootTexture or self.objectTexture) and DMV_BOSS_PIN_SIZE_ALT or DMV_BOSS_PIN_SIZE
-		self:SetWidth(baseSize)
-		self:SetHeight(baseSize)
-		self.highlight:SetAlpha(0)
+	pin:SetScript("OnLeave", function()
+		local baseSize = (pin.altTexture or pin.lootTexture or pin.objectTexture) and DMV_BOSS_PIN_SIZE_ALT or DMV_BOSS_PIN_SIZE
+		pin:SetWidth(baseSize)
+		pin:SetHeight(baseSize)
+		pin.highlight:SetAlpha(0)
 		WorldMapTooltip:Hide()
 	end)
 
 	pin:SetScript("OnMouseDown", function(self, button)
+		button = button or arg1
 		if button == "RightButton" then
 			DMV_HideFrames()
 			return
 		end
 		if button ~= "LeftButton" then return end
 		if DMV_CalibMode then
-			if IsControlKeyDown() and self.instanceMapID and self.bossOrdinal then
+			if IsControlKeyDown() and pin.instanceMapID and pin.bossOrdinal then
 				if not DMV_GlobalSettings.bossPinOverrides then DMV_GlobalSettings.bossPinOverrides = {} end
-				local inst = DMV_GlobalSettings.bossPinOverrides[self.instanceMapID]
-				if not inst then inst = {}; DMV_GlobalSettings.bossPinOverrides[self.instanceMapID] = inst end
-				local e = inst[self.bossOrdinal]
-				if not e then e = {}; inst[self.bossOrdinal] = e end
+				local inst = DMV_GlobalSettings.bossPinOverrides[pin.instanceMapID]
+				if not inst then inst = {}; DMV_GlobalSettings.bossPinOverrides[pin.instanceMapID] = inst end
+				local e = inst[pin.bossOrdinal]
+				if not e then e = {}; inst[pin.bossOrdinal] = e end
 				e.removed = not e.removed
-				print(string.format("|cff00ff00DMV calib|r: %s %s", self.bossName,
+				print(string.format("|cff00ff00DMV calib|r: %s %s", pin.bossName,
 					e.removed and "|cffff4040removed|r" or "|cff40ff40restored|r"))
 				DMV_HideBossPins()
 				DMV_ShowBossPins()
 				return
 			end
-			if IsShiftKeyDown() and self.instanceMapID and self.bossOrdinal then
+			if IsShiftKeyDown() and pin.instanceMapID and pin.bossOrdinal then
 				local inst = DMV_GlobalSettings.bossPinOverrides
-					and DMV_GlobalSettings.bossPinOverrides[self.instanceMapID]
-				if inst then inst[self.bossOrdinal] = nil end
+					and DMV_GlobalSettings.bossPinOverrides[pin.instanceMapID]
+				if inst then inst[pin.bossOrdinal] = nil end
 				print(string.format("|cff00ff00DMV calib|r: %s - position reset (place it on the correct floor)",
-					self.bossName))
+					pin.bossName))
 				DMV_HideBossPins()
 				DMV_ShowBossPins()
 				return
 			end
-			self.isDragging = true
-			self:SetScript("OnUpdate", function(s)
+			pin.isDragging = true
+			pin:SetScript("OnUpdate", function(self, elapsed)
+				-- The new ClassicAPI runner passes (self, elapsed) positionally;
+				-- the old 1.12 runner set `this` as a global with no parameters.
+				local s = self or pin
 				local csc = DMV_Container:GetEffectiveScale()
 				local mx, my = GetCursorPosition()
 				mx, my = mx / csc, my / csc
@@ -1179,21 +1299,21 @@ local function DMV_CreateBossPin(pinIndex)
 					end
 				end
 			end)
-		elseif self.atlasKey and self.atlasEntries then
+		elseif pin.atlasKey and pin.atlasEntries then
 			-- Multiple boss entries under the same atlas key: pick one at random.
-			local idx = self.atlasEntries[math.random(#self.atlasEntries)]
+			local idx = pin.atlasEntries[math.random(#pin.atlasEntries)]
 			if AtlasLoot_ShowBossLoot and idx and idx ~= 0 then
-				DMV_OpenAtlasLootBoss(self.atlasKey, idx)
+				DMV_OpenAtlasLootBoss(pin.atlasKey, idx)
 			else
-				DMV_OpenAtlasBoss(self.atlasKey)
+				DMV_OpenAtlasBoss(pin.atlasKey)
 			end
-		elseif self.atlasKey then
+		elseif pin.atlasKey then
 			-- If AtlasLoot is present, open Atlas to the dungeon and show
 			-- boss loot. Otherwise just open Atlas to the dungeon map.
-			if AtlasLoot_ShowBossLoot and self.atlasBossIndex and self.atlasBossIndex ~= 0 then
-				DMV_OpenAtlasLootBoss(self.atlasKey, self.atlasBossIndex)
+			if AtlasLoot_ShowBossLoot and pin.atlasBossIndex and pin.atlasBossIndex ~= 0 then
+				DMV_OpenAtlasLootBoss(pin.atlasKey, pin.atlasBossIndex)
 			else
-				DMV_OpenAtlasBoss(self.atlasKey)
+				DMV_OpenAtlasBoss(pin.atlasKey)
 			end
 		end
 	end)
@@ -1214,17 +1334,14 @@ end
 local DMV_DungeonNameToId = nil
 local function DMV_GetInstanceIdForDungeon(name)
 	if not name then return nil end
-	if not DMV_DungeonNameToId then
-		DMV_DungeonNameToId = {}
-		if DMV_DungeonByMapID then
-			for id, folder in pairs(DMV_DungeonByMapID) do
-				if DMV_DungeonNameToId[folder] == nil then
-					DMV_DungeonNameToId[folder] = id
-				end
+	if DMV_DungeonByMapID then
+		for id, entry in pairs(DMV_DungeonByMapID) do
+			if entry[1] == name then
+				return id
 			end
 		end
 	end
-	return DMV_DungeonNameToId[name]
+	return nil
 end
 
 -- Resolve a name from a prefixed ID string.
@@ -1390,7 +1507,7 @@ function DMV_ShowBossPins()
 	DMV_HideBossPins()
 
 	local instanceMapID
-	if DMV_PreviewMode then
+	if DMV_PreviewMode and DMV_CurrentDungeon then
 		instanceMapID = DMV_GetInstanceIdForDungeon(DMV_CurrentDungeon)
 	else
 		local _, _, _, _, _, _, _, iid = GetInstanceInfo()
@@ -1633,6 +1750,23 @@ function DMV_HideFrames()
 	end
 end
 
+-- Leaving an instance (portal, hearth, death, logout) never closes the world
+-- map while outside, so DMV_OnMapHide never gets the chance to clear the
+-- instance browse state that DMV_OnMapShow set while inside the dungeon.
+-- The stale state made the hooked WorldMapZoneDropDown_Initialize keep
+-- listing instances, and Blizzard's SetSelectedID(GetCurrentMapZone()) then
+-- picked whatever instance sat at the real zone's index. Mirror the cleanup
+-- DMV_OnMapHide performs outside instances.
+function DMV_ResetBrowseStateOnInstanceExit()
+	if not DMV_InstanceBrowseMode and not DMV_InstanceZoneID then return end
+	DMV_ClearBrowseState()
+	local zoneDD = GetZoneDropdown()
+	if zoneDD then
+		zoneDD.selectedID = nil
+		UIDropDownMenu_Initialize(zoneDD, WorldMapZoneDropDown_Initialize)
+	end
+end
+
 -- Event handler: Player enters world or instance
 function DMV_OnEnterWorld()
 	DMV_PreviewMode = false
@@ -1672,6 +1806,7 @@ function DMV_OnEnterWorld()
 		else
 			DMV_CurrentDungeon = nil
 			DMV_HideFrames()
+			DMV_ResetBrowseStateOnInstanceExit()
 		end
 	else
 		-- Player has left all dungeons. Wipe persisted floor memory so a
@@ -1683,6 +1818,7 @@ function DMV_OnEnterWorld()
 		end
 		DMV_CurrentDungeon = nil
 		DMV_HideFrames()
+		DMV_ResetBrowseStateOnInstanceExit()
 	end
 end
 
@@ -1694,6 +1830,8 @@ function DMV_StartTransitionTicker()
 	if DMV_TransitionFrame then return end
 	DMV_TransitionFrame = CreateFrame("Frame", "DMV_TransitionFrame")
 	DMV_TransitionFrame:SetScript("OnUpdate", function(self, elapsed)
+		-- ClassicAPI may expose the OnUpdate delta through legacy arg1.
+		elapsed = tonumber(elapsed) or tonumber(arg1) or 0
 		DMV_TransitionElapsed = DMV_TransitionElapsed + elapsed
 		if DMV_TransitionElapsed >= DMV_TRANSITION_INTERVAL then
 			DMV_TransitionElapsed = 0
@@ -1733,9 +1871,7 @@ function DMV_ApplyRealFloorChange(toFloor)
 		if DMV_HideMarkerList then DMV_HideMarkerList() end
 		CloseDropDownMenus()
 		DMV_HideFrames()
-		DMV_InstanceBrowseMode	= nil
-		DMV_InstanceContinentID = nil
-		DMV_InstanceZoneID		= nil
+		DMV_ClearBrowseState()
 		SetMapToCurrentZone()
 		local zoneDD = WorldMapZoneDropDown or WorldMapZoneDropdown
 		if zoneDD then
@@ -2122,6 +2258,12 @@ EventFrame:RegisterEvent("QUEST_DATA_LOAD_RESULT")
 EventFrame:RegisterEvent("GET_ITEM_INFO_RECEIVED")
 
 EventFrame:SetScript("OnEvent", function(self, event, arg1, arg2)
+	-- Keep working with both ClassicAPI's positional dispatcher and the
+	-- original 1.12 dispatcher, which exposes event payloads as globals.
+	event = event or _G.event
+	if arg1 == nil then arg1 = _G.arg1 end
+	if arg2 == nil then arg2 = _G.arg2 end
+
 	if event == "ADDON_LOADED" and arg1 == "Atlas" then
 		-- When AtlasFrame is closed, restore its frame level to the default (0)
 		-- so subsequent non-DMV opens are unaffected.
@@ -2140,6 +2282,9 @@ EventFrame:SetScript("OnEvent", function(self, event, arg1, arg2)
 		if DMV_Settings.showRaidBlips  == nil then DMV_Settings.showRaidBlips  = true end
 		if not DMV_GlobalSettings then DMV_GlobalSettings = {} end
 		if DMV_GlobalSettings.bossPinOverrides == nil then DMV_GlobalSettings.bossPinOverrides = {} end
+		-- ADDON_LOADED is the reliable point at which the addon's code and
+		-- saved variables are ready. PLAYER_ENTERING_WORLD remains a retry.
+		DMV_CreateInterfaceOptionsPanel()
 	elseif event == "PLAYER_ENTERING_WORLD" then
 		DMV_CreateInterfaceOptionsPanel()
 		-- Reset faction cache so it re-queries once the player is in world.
@@ -2184,6 +2329,11 @@ EventFrame:SetScript("OnEvent", function(self, event, arg1, arg2)
 			if DMV_Settings then DMV_Settings.activeTransition = nil end
 		end
 	elseif event == "WORLD_MAP_UPDATE" then
+		-- Maintain spoofed continent dropdown text during browse mode
+		if DMV_InstanceBrowseMode then
+			DMV_ApplyBrowseModeText(GetContinentDropdown())
+		end
+
 		-- If the player manually navigated the world map (continent/zone/zoom)
 		-- while the dungeon overlay is visible, hide the overlay so the selected
 		-- map shows through. DMV_OnMapShow will restore it when the map is
@@ -2275,23 +2425,31 @@ end)
 local function DMV_OnMapShow()
 	if not DMV_Initialized then DMV_CreateFrames() end
 
-	-- If CurrentDungeon was wiped because the map was closed during a preview
-	-- session, re-detect from GetInstanceInfo so a real dungeon is restored.
-	if not DMV_CurrentDungeon then
-		local _, instanceType, _, _, _, _, _, instanceMapID = GetInstanceInfo()
-		if (instanceType == "party" or instanceType == "raid") and instanceMapID then
-			local entry = DMV_DungeonByMapID[instanceMapID]
-			if entry then
-				DMV_CurrentDungeon = entry[1]
-				if not DMV_ActualFloor or DMV_ActualFloor == 0 then
-					DMV_ActualFloor = DMV_LastKnownFloor[instanceMapID] or 1
+	local _, instanceType, _, _, _, _, _, instanceMapID = GetInstanceInfo()
+	
+	-- Auto-detect and populate dropdowns when physically inside an instance
+	if (instanceType == "party" or instanceType == "raid") and instanceMapID then
+		local entry = DMV_DungeonByMapID[instanceMapID]
+		if entry then
+			DMV_CurrentDungeon = entry[1]
+			DMV_InstanceBrowseMode = entry[3] and "raid" or "dungeon"
+			
+			-- Find current instance ID in the sorted list
+			local list = DMV_BuildInstanceList(DMV_InstanceBrowseMode == "raid")
+			for i, item in ipairs(list) do
+				if item.mapID == instanceMapID then
+					DMV_InstanceZoneID = i
+					break
 				end
+			end
+			
+			if not DMV_ActualFloor or DMV_ActualFloor == 0 then
+				DMV_ActualFloor = DMV_LastKnownFloor[instanceMapID] or 1
 			end
 		end
 	end
 
 	if DMV_CurrentDungeon then
-		local _, _, _, _, _, _, _, instanceMapID = GetInstanceInfo()
 		local tr = DMV_Settings and DMV_Settings.activeTransition
 		if tr and tr.instanceMapID == instanceMapID and tr.floor then
 			if tr.floor ~= DMV_ActualFloor then
@@ -2299,48 +2457,50 @@ local function DMV_OnMapShow()
 				DMV_ActualFloor = tr.floor
 			end
 		end
-		-- Always re-apply textures so any stale preview dungeon is cleared.
+		
 		DMV_SetTextures(DMV_CurrentDungeon, DMV_ActualFloor or DMV_CurrentFloor)
 		DMV_ShowFrames()
+		
+		-- Force update dropdown labels for active instance
+		local continentDD = GetContinentDropdown()
+		if continentDD then
+			local modeText = (DMV_InstanceBrowseMode == "raid") and L["Raids"] or L["Dungeons"]
+			UIDropDownMenu_SetText(modeText, continentDD)
+		end
+
+		if DMV_InstanceZoneID then
+			DMV_ApplyInstanceZoneText(GetZoneDropdown(), DMV_BuildInstanceList(DMV_InstanceBrowseMode == "raid"))
+		end
 	end
 end
 
 local function DMV_OnMapHide()
 	DMV_Visible = false
-	-- Both custom dropdowns are parented independently of the map's normal
-	-- dropdown pool, so explicitly close them whenever the world map closes.
 	if DMV_HideAreaList then DMV_HideAreaList() end
 	if DMV_HideMarkerList then DMV_HideMarkerList() end
 	if DMV_ClickFrame then DMV_ClickFrame:Hide() end
 	DMV_StopArrowUpdates()
 
-	-- If the map was closed while showing a preview dungeon (browse mode),
-	-- hide the frames and restore the real map so it shows correctly on next open.
 	if DMV_PreviewMode then
 		DMV_HideFrames()
 		SetMapToCurrentZone()
 	end
 
-	-- Clear instance browse mode; it is transient UI state that must not
-	-- persist across map open/close cycles.
-	DMV_InstanceBrowseMode	= nil
-	DMV_InstanceContinentID = nil
-	DMV_InstanceZoneID		= nil
+	-- Only clear browse mode if NOT physically inside a dungeon or raid
+	local _, instanceType = GetInstanceInfo()
+	if instanceType ~= "party" and instanceType ~= "raid" then
+		DMV_ClearBrowseState()
 
-	-- Re-initialize the zone dropdown so it reverts to real zones rather
-	-- than the stale dungeon/raid list from browse mode.
-	local zoneDD = GetZoneDropdown()
-	if zoneDD then
-		UIDropDownMenu_Initialize(zoneDD, WorldMapZoneDropDown_Initialize)
+		local zoneDD = GetZoneDropdown()
+		if zoneDD then
+			UIDropDownMenu_Initialize(zoneDD, WorldMapZoneDropDown_Initialize)
+		end
 	end
 end
 
 WorldMapFrame:HookScript("OnShow", DMV_OnMapShow)
 WorldMapFrame:HookScript("OnHide", DMV_OnMapHide)
 
--- Polling fallback: detect map open/close each ticker tick so that addons
--- which overwrite WorldMapFrame's OnShow via SetScript (e.g. Magnify) do not
--- silently prevent DMV_OnMapShow from running.
 -- Polling fallback frame: always running, low cost (IsShown is cheap).
 -- Catches map open/close events even when addons like Magnify overwrite
 -- WorldMapFrame's OnShow/OnHide scripts via SetScript.
@@ -2368,7 +2528,7 @@ end)
 -- (DMV_InstanceBrowseMode/ContinentID/ZoneID declared at top of file)
 
 -- Build sorted { mapID, displayName } list for dungeons or raids.
-local function DMV_BuildInstanceList(raidsOnly)
+function DMV_BuildInstanceList(raidsOnly)
 	local list = {}
 	for mapID, entry in pairs(DMV_DungeonByMapID) do
 		local isRaid = entry[3]
@@ -2380,76 +2540,119 @@ local function DMV_BuildInstanceList(raidsOnly)
 	return list
 end
 
--- Hook continent dropdown to append Dungeons / Raids entries.
+-- Hook continent dropdown to append Dungeons / Raids entries and safely reset state when on real continents
 local _origContinentsInit = WorldMapContinentsDropDown_Initialize
 WorldMapContinentsDropDown_Initialize = function()
-	_origContinentsInit()
-	local continentDD = WorldMapContinentDropDown or WorldMapContinentDropdown
+	local currentContinent = GetCurrentMapContinent()
 	local continents = { GetMapContinents() }
 	local numContinents = #continents
+
+	-- If the user is currently looking at a real physical continent and has NOT selected an instance yet,
+	-- clear the uncommitted browse mode so the zone dropdown resets properly.
+	if currentContinent and currentContinent > 0 and currentContinent <= numContinents and not DMV_InstanceZoneID then
+		DMV_ClearBrowseState()
+	end
+
+	_origContinentsInit()
+	
+	local continentDD = GetContinentDropdown()
 	local dungeonID = numContinents + 1
 	local raidID	= numContinents + 2
+	
+	-- Add a Dungeons or Raids category entry to the continent dropdown.
+	local function AddCategory(mode, label, categoryID)
+		local info = {}
+		info.text = label
+		info.func = function()
+			DMV_InstanceBrowseMode = mode
+			DMV_InstanceZoneID = nil
 
-	local info = {}
-	info.text = L["Dungeons"]
-	info.func = function()
-		DMV_InstanceBrowseMode = "dungeon"
-		DMV_InstanceZoneID = nil
-		DMV_InstanceContinentID = dungeonID
+			local zoneDD = GetZoneDropdown()
+			if zoneDD then
+				zoneDD.selectedID = nil
+				UIDropDownMenu_SetSelectedID(zoneDD, nil)
+				UIDropDownMenu_SetText("", zoneDD)
+				UIDropDownMenu_Initialize(zoneDD, WorldMapZoneDropDown_Initialize)
+			end
+
+			UIDropDownMenu_SetSelectedID(continentDD, categoryID)
+			UIDropDownMenu_SetText(label, continentDD)
+		end
+		info.checked = (DMV_InstanceBrowseMode == mode)
+		UIDropDownMenu_AddButton(info)
+	end
+	AddCategory("dungeon", L["Dungeons"], dungeonID)
+	AddCategory("raid", L["Raids"], raidID)
+
+	if DMV_InstanceBrowseMode == "dungeon" then
 		UIDropDownMenu_SetSelectedID(continentDD, dungeonID)
-		local zoneDD = WorldMapZoneDropDown or WorldMapZoneDropdown
-		if zoneDD then
-			UIDropDownMenu_Initialize(zoneDD, WorldMapZoneDropDown_Initialize)
-		end
-	end
-	UIDropDownMenu_AddButton(info)
-
-	info = {}
-	info.text = L["Raids"]
-	info.func = function()
-		DMV_InstanceBrowseMode = "raid"
-		DMV_InstanceZoneID = nil
-		DMV_InstanceContinentID = raidID
+		UIDropDownMenu_SetText(L["Dungeons"], continentDD)
+	elseif DMV_InstanceBrowseMode == "raid" then
 		UIDropDownMenu_SetSelectedID(continentDD, raidID)
-		local zoneDD = WorldMapZoneDropDown or WorldMapZoneDropdown
-		if zoneDD then
-			UIDropDownMenu_Initialize(zoneDD, WorldMapZoneDropDown_Initialize)
-		end
+		UIDropDownMenu_SetText(L["Raids"], continentDD)
 	end
-	UIDropDownMenu_AddButton(info)
-
 end
 
--- Hook zone dropdown to show instance names when a category is selected.
+-- Intercept button addition to strip checkmarks from real continents when browsing instances
+local _origAddButton = UIDropDownMenu_AddButton
+UIDropDownMenu_AddButton = function(info, level)
+	if DMV_InstanceBrowseMode and level == 1 then
+		if info.text ~= L["Dungeons"] and info.text ~= L["Raids"] then
+			-- Force checked to explicit boolean false for real continents while browsing
+			info.checked = false
+		end
+	end
+	_origAddButton(info, level)
+end
+
+-- Hook zone dropdown to show instance names when a category is selected and manage checkmarks
 local _origZoneInit = WorldMapZoneDropDown_Initialize
 WorldMapZoneDropDown_Initialize = function()
 	if not DMV_InstanceBrowseMode then
 		_origZoneInit()
 		return
 	end
-	local zoneDD = WorldMapZoneDropDown or WorldMapZoneDropdown
+
+	local zoneDD = GetZoneDropdown()
 	local list = DMV_BuildInstanceList(DMV_InstanceBrowseMode == "raid")
+
+	-- If no instance has been selected yet, clear selectedID so UIDropDownMenu doesn't check item 1
+	if not DMV_InstanceZoneID then
+		zoneDD.selectedID = nil
+	end
+
 	for i, entry in ipairs(list) do
 		local mapID   = entry.mapID
 		local entryID = i
 		local info = {}
 		info.text = entry.name
+
+		-- STRICT CHECKMARK CONTROL: Only checked if an instance is explicitly selected
+		info.checked = (DMV_InstanceZoneID ~= nil and DMV_InstanceZoneID == entryID)
+
 		info.func = function()
 			local folder = DMV_DungeonByMapID[mapID] and DMV_DungeonByMapID[mapID][1]
 			if not folder then return end
 			DMV_InstanceZoneID = entryID
 			UIDropDownMenu_SetSelectedID(zoneDD, entryID)
+
 			DMV_HideFrames()
 			DMV_PreviewMode = true
-			-- Switch to the opposite continent so the player arrow has no
-			-- valid position and stays hidden. SetMapToCurrentZone() on
-			-- preview exit restores the correct location.
+
+			-- Switch to opposite continent so vanilla player arrow stays hidden
 			local currentContinent = GetCurrentMapContinent()
 			if currentContinent == 1 then
 				SetMapZoom(2)
 			else
 				SetMapZoom(1)
 			end
+
+			-- Restore Continent and Zone dropdown texts right after SetMapZoom resets them
+			DMV_ApplyBrowseModeText(GetContinentDropdown())
+
+			UIDropDownMenu_SetSelectedID(zoneDD, entryID)
+			UIDropDownMenu_SetText(entry.name, zoneDD)
+
 			DMV_SetTextures(folder, 1)
 			if WorldMapFrame:IsVisible() then
 				DMV_ShowFrames()
@@ -2457,14 +2660,15 @@ WorldMapZoneDropDown_Initialize = function()
 		end
 		UIDropDownMenu_AddButton(info)
 	end
+
+	-- Populate label text if an instance is active
+	DMV_ApplyInstanceZoneText(zoneDD, list)
 end
 
 -- Clicking a real continent clears instance browse mode.
 local _origContinentClick = WorldMapContinentButton_OnClick
 WorldMapContinentButton_OnClick = function()
-	DMV_InstanceBrowseMode = nil
-	DMV_InstanceContinentID = nil
-	DMV_InstanceZoneID = nil
+	DMV_ClearBrowseState()
 	_origContinentClick()
 end
 
@@ -2483,7 +2687,6 @@ local DMV_OptionsPanelCreated = false
 function DMV_CreateInterfaceOptionsPanel()
 	if DMV_OptionsPanelCreated then return end
 	if not InterfaceOptions_AddCategory then return end
-	DMV_OptionsPanelCreated = true
 
 	local panel = CreateFrame("Frame")
 	panel.name = "DungeonMapsVanilla"
@@ -2502,16 +2705,18 @@ function DMV_CreateInterfaceOptionsPanel()
 	slider:SetMinMaxValues(0.5, 1.0)
 	slider:SetValueStep(0.05)
 	if slider.SetObeyStepOnDrag then slider:SetObeyStepOnDrag(true) end
-	DMV_WindowScaleSliderLow:SetText("0.50")
-	DMV_WindowScaleSliderHigh:SetText("1.00")
-	DMV_WindowScaleSliderText:SetText("")
+	if DMV_WindowScaleSliderLow then DMV_WindowScaleSliderLow:SetText("0.50") end
+	if DMV_WindowScaleSliderHigh then DMV_WindowScaleSliderHigh:SetText("1.00") end
+	if DMV_WindowScaleSliderText then DMV_WindowScaleSliderText:SetText("") end
 
 	local valueText = slider:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
 	valueText:SetPoint("TOP", slider, "BOTTOM", 0, -2)
 	slider.valueText = valueText
 
 	slider:SetScript("OnValueChanged", function(self, val)
-		if self.updating then return end
+		local control = self or this or slider
+		if val == nil then val = _G.arg1 end
+		if control.updating then return end
 		val = math.floor(val / 0.05 + 0.5) * 0.05
 		valueText:SetText(string.format("%.2f", val))
 		DMV_SetWindowScale(val)
@@ -2519,25 +2724,46 @@ function DMV_CreateInterfaceOptionsPanel()
 
 	local blipCheck = CreateFrame("CheckButton", "DMV_PartyBlipCheck", panel, "UICheckButtonTemplate")
 	blipCheck:SetPoint("TOPLEFT", 12, -120)
-	DMV_PartyBlipCheckText:SetText(L["Opt2"])
+	if DMV_PartyBlipCheckText then
+		DMV_PartyBlipCheckText:SetText(L["Opt2"])
+	else
+		local label = blipCheck:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+		label:SetPoint("LEFT", blipCheck, "RIGHT", 4, 0)
+		label:SetText(L["Opt2"])
+	end
 	blipCheck:SetScript("OnClick", function(self)
-		if DMV_Settings then DMV_Settings.showPartyBlips = self:GetChecked() and true or false end
+		local control = self or this or blipCheck
+		if DMV_Settings then DMV_Settings.showPartyBlips = control:GetChecked() and true or false end
 		if DMV_UpdatePartyBlips then DMV_UpdatePartyBlips() end
 	end)
 
 	local raidBlipCheck = CreateFrame("CheckButton", "DMV_RaidBlipCheck", panel, "UICheckButtonTemplate")
 	raidBlipCheck:SetPoint("TOPLEFT", 12, -148)
-	DMV_RaidBlipCheckText:SetText(L["Opt2b"])
+	if DMV_RaidBlipCheckText then
+		DMV_RaidBlipCheckText:SetText(L["Opt2b"])
+	else
+		local label = raidBlipCheck:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+		label:SetPoint("LEFT", raidBlipCheck, "RIGHT", 4, 0)
+		label:SetText(L["Opt2b"])
+	end
 	raidBlipCheck:SetScript("OnClick", function(self)
-		if DMV_Settings then DMV_Settings.showRaidBlips = self:GetChecked() and true or false end
+		local control = self or this or raidBlipCheck
+		if DMV_Settings then DMV_Settings.showRaidBlips = control:GetChecked() and true or false end
 		if DMV_UpdatePartyBlips then DMV_UpdatePartyBlips() end
 	end)
 
 	local markerCheck = CreateFrame("CheckButton", "DMV_ShowMarkersCheck", panel, "UICheckButtonTemplate")
 	markerCheck:SetPoint("TOPLEFT", 12, -176)
-	DMV_ShowMarkersCheckText:SetText(L["Opt3"])
+	if DMV_ShowMarkersCheckText then
+		DMV_ShowMarkersCheckText:SetText(L["Opt3"])
+	else
+		local label = markerCheck:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+		label:SetPoint("LEFT", markerCheck, "RIGHT", 4, 0)
+		label:SetText(L["Opt3"])
+	end
 	markerCheck:SetScript("OnClick", function(self)
-		if DMV_Settings then DMV_Settings.showMarkersDropdown = self:GetChecked() and true or false end
+		local control = self or this or markerCheck
+		if DMV_Settings then DMV_Settings.showMarkersDropdown = control:GetChecked() and true or false end
 		if DMV_BossPinDropDown then
 			if DMV_Settings and DMV_Settings.showMarkersDropdown ~= false then
 				if WorldMapFrame:IsVisible() and DMV_BossPinDropDown:IsVisible() ~= nil then
@@ -2551,9 +2777,16 @@ function DMV_CreateInterfaceOptionsPanel()
 
 	local coordCheck = CreateFrame("CheckButton", "DMV_ShowCoordsCheck", panel, "UICheckButtonTemplate")
 	coordCheck:SetPoint("TOPLEFT", 12, -204)
-	DMV_ShowCoordsCheckText:SetText(L["Opt4"])
+	if DMV_ShowCoordsCheckText then
+		DMV_ShowCoordsCheckText:SetText(L["Opt4"])
+	else
+		local label = coordCheck:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+		label:SetPoint("LEFT", coordCheck, "RIGHT", 4, 0)
+		label:SetText(L["Opt4"])
+	end
 	coordCheck:SetScript("OnClick", function(self)
-		if DMV_Settings then DMV_Settings.showCoords = self:GetChecked() and true or false end
+		local control = self or this or coordCheck
+		if DMV_Settings then DMV_Settings.showCoords = control:GetChecked() and true or false end
 		if not DMV_CoordsDisabled then
 			local show = DMV_Settings and DMV_Settings.showCoords ~= false
 			if DMV_CoordsFrame		 then DMV_CoordsFrame[show and "Show" or "Hide"](DMV_CoordsFrame) end
@@ -2606,6 +2839,123 @@ function DMV_CreateInterfaceOptionsPanel()
 	end
 
 	InterfaceOptions_AddCategory(panel)
+	DMV_OptionsPanelCreated = true
+end
+
+-- Cleanup uncommitted browse mode when closing menus or clicking away on real continents
+local DMV_DropdownCleanupFrame = CreateFrame("Frame", "DMV_DropdownCleanupFrame", WorldMapFrame)
+DMV_DropdownCleanupFrame:RegisterEvent("WORLD_MAP_UPDATE")
+DMV_DropdownCleanupFrame:SetScript("OnEvent", function()
+	if DMV_InstanceBrowseMode and not DMV_InstanceZoneID then
+		if not DropDownList1:IsShown() and not DropDownList2:IsShown() then
+			local currentContinent = GetCurrentMapContinent()
+			local continents = { GetMapContinents() }
+			if currentContinent and currentContinent > 0 and currentContinent <= #continents then
+				DMV_ClearBrowseState()
+
+				local zoneDD = GetZoneDropdown()
+				if zoneDD and _origZoneInit then
+					UIDropDownMenu_Initialize(zoneDD, _origZoneInit)
+					local zone = GetCurrentMapZone()
+					if zone and zone > 0 then
+						UIDropDownMenu_SetSelectedID(zoneDD, zone)
+					else
+						UIDropDownMenu_SetSelectedID(zoneDD, 0)
+					end
+					UIDropDownMenu_SetText(GetZoneText() or "", zoneDD)
+				end
+			end
+		end
+	end
+end)
+
+-- True when the dungeon overlay is hidden and a real world/continent/zone map
+-- is displayed (continent 0 = both continents, >0 = continent or zone).
+function DMV_IsOnRealWorldMap()
+	if DMV_Visible then return false end
+	local continent = GetCurrentMapContinent()
+	return continent ~= nil and continent >= 0
+end
+
+-- Force WorldMapZoomOutButton to invoke the working right-click handler
+if WorldMapZoomOutButton then
+	local origZoomOnClick = WorldMapZoomOutButton:GetScript("OnClick")
+	WorldMapZoomOutButton:SetScript("OnClick", function()
+		-- If the player is inside a dungeon but has navigated to a real world map
+		-- (a continent or zone, e.g. Kalimdor > Desolace) the overlay is hidden and
+		-- the vanilla zoom-out (zone -> continent -> world) must be used instead.
+		local onRealMap = DMV_IsOnRealWorldMap()
+		-- If we are browsing or previewing a map...
+		if DMV_InstanceBrowseMode or DMV_PreviewMode or (DMV_CurrentDungeon and not onRealMap) then
+			-- Find the frame carrying your right-click script (clickFrame or WorldMapButton)
+			local clickFrame = DMV_ClickFrame or WorldMapButton or WorldMapDetailTile1
+			
+			if clickFrame then
+				local rightClickScript = clickFrame:GetScript("OnMouseDown") or clickFrame:GetScript("OnClick")
+				if rightClickScript then
+					-- Execute your exact right-click logic with "RightButton"
+					rightClickScript(clickFrame, "RightButton")
+					return
+				end
+			end
+		end
+
+		-- Fall back to default WoW Zoom Out button behavior if not browsing
+		if origZoomOnClick then
+			origZoomOnClick()
+		else
+			WorldMapZoomOutButton_OnClick()
+		end
+	end)
+end
+
+-- Directly enforce Zoom Out button state when opening the map or inside an instance
+local function DMV_UpdateZoomOutButton()
+	if not WorldMapZoomOutButton then return end
+
+	local isInside = IsInInstance and IsInInstance()
+	local isBrowsing = (DMV_InstanceBrowseMode ~= nil) or DMV_PreviewMode
+
+	-- If inside an instance or browsing, ensure the button is usable
+	if isBrowsing then
+		WorldMapZoomOutButton:Enable()
+	elseif isInside and DMV_CurrentDungeon then
+		if DMV_IsOnRealWorldMap() then
+			-- Viewing a real map from inside a dungeon: mirror vanilla behaviour.
+			-- Nothing to zoom out to from the both-continents view.
+			if GetCurrentMapContinent() == 0 then
+				WorldMapZoomOutButton:Disable()
+			else
+				WorldMapZoomOutButton:Enable()
+			end
+		else
+			WorldMapZoomOutButton:Enable()
+		end
+	end
+end
+
+-- Re-evaluate the button on every map change (runs after the main
+-- WORLD_MAP_UPDATE handler, which hides the overlay when navigating away).
+local DMV_ZoomOutStateFrame = CreateFrame("Frame", "DMV_ZoomOutStateFrame", WorldMapFrame)
+DMV_ZoomOutStateFrame:RegisterEvent("WORLD_MAP_UPDATE")
+DMV_ZoomOutStateFrame:SetScript("OnEvent", function()
+	DMV_UpdateZoomOutButton()
+end)
+
+-- Hook WorldMapFrame OnShow to guarantee button state on open
+if WorldMapFrame then
+	WorldMapFrame:HookScript("OnShow", function()
+		DMV_UpdateZoomOutButton()
+	end)
+end
+
+-- Also hook default update function as a secondary check
+local _origWorldMapFrame_Update = WorldMapFrame_Update
+WorldMapFrame_Update = function()
+	if _origWorldMapFrame_Update then
+		_origWorldMapFrame_Update()
+	end
+	DMV_UpdateZoomOutButton()
 end
 
 SLASH_DMV1 = "/dmv"

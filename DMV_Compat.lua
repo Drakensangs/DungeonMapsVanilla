@@ -212,19 +212,23 @@ local function DMV_ApplyMagnifyCompat()
 
 	local DMV_FlashTicker = CreateFrame("Frame")
 	DMV_FlashTicker:Hide()
-	DMV_FlashTicker:SetScript("OnUpdate", function()
-		this.Elapsed = this.Elapsed + arg1
-		if this.Elapsed > MAGNIFY_PLAYER_FLASH_INTERVAL then
-			this.Elapsed = 0
-			if this.Flashes < MAGNIFY_PLAYER_FLASH_COUNT then
-				this.Flashes = this.Flashes + 1
+	DMV_FlashTicker:SetScript("OnUpdate", function(self, elapsed)
+		-- New ClassicAPI runner passes (self, elapsed) positionally.
+		-- Fall back to legacy globals for older runner compatibility.
+		self = self or DMV_FlashTicker
+		elapsed = tonumber(elapsed) or tonumber(arg1) or 0
+		self.Elapsed = self.Elapsed + elapsed
+		if self.Elapsed > MAGNIFY_PLAYER_FLASH_INTERVAL then
+			self.Elapsed = 0
+			if self.Flashes < MAGNIFY_PLAYER_FLASH_COUNT then
+				self.Flashes = self.Flashes + 1
 				if DMV_PlayerArrow then
 					DMV_PlayerArrow:SetAlpha(DMV_PlayerArrow:GetAlpha() == 1 and 0 or 1)
 				end
 			else
-				this.Flashes = 0
+				self.Flashes = 0
 				if DMV_PlayerArrow then DMV_PlayerArrow:SetAlpha(1) end
-				this:Hide()
+				self:Hide()
 			end
 		end
 	end)
@@ -245,6 +249,9 @@ local function DMV_ApplyMagnifyCompat()
 		origShow(...)
 		DMV_InstallWheelHandler()
 		DMV_FlashPlayerArrow()
+		if WorldMapZoomOutButton and not DMV_IsOnRealWorldMap() then
+			WorldMapZoomOutButton:Enable()
+		end
 	end
 
 	-- 3. Strata: raise DMV controls above Magnify's scroll frame
@@ -266,6 +273,18 @@ local function DMV_ApplyMagnifyCompat()
 		end
 	end
 	RaiseControls()
+	
+	-- Ensure controls and mouse responsiveness persist on continent/map updates
+	local updateEventFrame = CreateFrame("Frame")
+	updateEventFrame:RegisterEvent("WORLD_MAP_UPDATE")
+	updateEventFrame:SetScript("OnEvent", function()
+		if WorldMapFrame and WorldMapFrame:IsShown() then
+			RaiseControls()
+			if DMV_ClickFrame then
+				DMV_ClickFrame:EnableMouse(true)
+			end
+		end
+	end)
 
 	-- 4. Area frame: suppress hover text while dungeon map is visible
 	if WorldMapFrameAreaFrame and not DMV_AreaFrameCompatInstalled then
@@ -521,10 +540,14 @@ local function DMV_ScheduleAtlasPriming()
 	if not AtlasFrame then return end
 	local primerFrame = CreateFrame("Frame")
 	primerFrame.timer = 0
-	primerFrame:SetScript("OnUpdate", function()
-		this.timer = this.timer + arg1
-		if this.timer >= 0.5 then
-			this:SetScript("OnUpdate", nil)
+	primerFrame:SetScript("OnUpdate", function(self, elapsed)
+		-- New ClassicAPI runner passes (self, elapsed) positionally.
+		-- Fall back to legacy globals for older runner compatibility.
+		self = self or primerFrame
+		elapsed = tonumber(elapsed) or tonumber(arg1) or 0
+		self.timer = self.timer + elapsed
+		if self.timer >= 0.5 then
+			self:SetScript("OnUpdate", nil)
 			DMV_ApplyAtlasPrimingFix()
 		end
 	end)
@@ -591,12 +614,28 @@ local function DMV_ApplypfQuestCompat()
 	end
 end
 
--- Atlas strata
--- AtlasFrame is raised to FULLSCREEN_DIALOG (toplevel) in DMV_OpenAtlasBoss,
--- placing it above pins and Magnify's WorldMapFrameAreaFrame while leaving
--- TOOLTIP free for item tooltips.  No further compat needed here.
---local function DMV_ApplyAtlasStrataFix()
---end
+-- Questie
+-- Call Questie:Toggle() to disable Questie while the dungeon overlay is shown
+-- and re-enable it when the overlay is hidden. Toggle() clears all notes and
+-- sets IsQuestieActive = false, which stops DRAW_NOTES from placing any icons.
+-- We only toggle off if Questie is currently active to avoid flipping its state
+-- when the player had it disabled themselves.
+local function DMV_ApplyQuestieCompat()
+	if not IsAddOnLoaded("!Questie") then return end
+
+	local origShow = DMV_ShowFrames
+	DMV_ShowFrames = function(...)
+		if IsQuestieActive then Questie:Toggle() end
+		return origShow(...)
+	end
+
+	local origHide = DMV_HideFrames
+	DMV_HideFrames = function(...)
+		local result = origHide(...)
+		if not IsQuestieActive then Questie:Toggle() end
+		return result
+	end
+end
 
 local compatFrame = CreateFrame("Frame")
 compatFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
@@ -609,4 +648,5 @@ compatFrame:SetScript("OnEvent", function()
 	DMV_ApplypfUICompat()
 	DMV_ApplyCoordCompat()
 	DMV_ApplypfQuestCompat()
+	DMV_ApplyQuestieCompat()
 end)
