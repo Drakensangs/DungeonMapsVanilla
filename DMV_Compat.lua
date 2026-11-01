@@ -401,9 +401,8 @@ end
 
 -- pfUI
 -- When pfUI's map module is active it skins the world map dropdowns.  DMV's
--- own dropdowns need the same treatment.  The "Switch to current zone" and
--- "Reveal Unexplored Areas" checkboxes also need repositioning because DMV
--- shifts the map frame layout.
+-- own dropdowns need the same treatment. The "Switch to current zone" and
+-- "Reveal Unexplored Areas" checkboxes also need repositioning.
 local function DMV_ApplypfUICompat()
 	if not (pfUI and pfUI.map) then return end
 
@@ -429,27 +428,61 @@ local function DMV_ApplypfUICompat()
 
 	if not pfUI.api or not pfUI.api.SkinDropDown then return end
 
-	if DMV_LevelDropDown	then pfUI.api.SkinDropDown(DMV_LevelDropDown) end
-	if DMV_BossPinDropDown	then pfUI.api.SkinDropDown(DMV_BossPinDropDown) end
-
-	-- Ensure the Dungeon Markers dropdown is closed on startup/login so its 
-	-- contents are not opened by default when pfUI is active.
-	if DMV_HideMarkerList then
-		DMV_HideMarkerList()
-	end
-
-	if pfUI.api.CreateBackdrop then
-		if DMV_MarkerList then pfUI.api.CreateBackdrop(DMV_MarkerList) end
-		if DMV_AreaList then pfUI.api.CreateBackdrop(DMV_AreaList) end
-	end
-
 	local pfUI_MenuOffsetY = -12
 
-	-- Hook or adjust toggle functions to apply the offset position
+	local function SkinCustomList(list)
+		if not list or list._pfUISkinned then return end
+		list._pfUISkinned = true
+		if pfUI.api.CreateBackdrop then
+			pfUI.api.CreateBackdrop(list)
+		end
+	end
+
+	local pfUISkinApplied = false
+
+	local function ApplypfUISkinOnce()
+		if pfUISkinApplied then return end
+		pfUISkinApplied = true
+
+		if DMV_LevelDropDown   then pfUI.api.SkinDropDown(DMV_LevelDropDown,   nil, nil, nil, true) end
+		if DMV_BossPinDropDown then pfUI.api.SkinDropDown(DMV_BossPinDropDown, nil, nil, nil, true) end
+
+		SkinCustomList(DMV_MarkerList)
+		SkinCustomList(DMV_AreaList)
+
+		if DMV_HideMarkerList then DMV_HideMarkerList() end
+
+		local pfUI_CoordsOffsetY = -5
+
+		if DMV_CoordsFrame then
+			local point, relTo, relPoint, x, y = DMV_CoordsFrame:GetPoint()
+			if point then
+				DMV_CoordsFrame:ClearAllPoints()
+				DMV_CoordsFrame:SetPoint(point, relTo, relPoint, x or 10, (y or -24) + pfUI_CoordsOffsetY)
+			end
+		end
+
+		if DMV_PlayerCoordsFrame then
+			local point, relTo, relPoint, x, y = DMV_PlayerCoordsFrame:GetPoint()
+			if point then
+				DMV_PlayerCoordsFrame:ClearAllPoints()
+				DMV_PlayerCoordsFrame:SetPoint(point, relTo, relPoint, x or -10, (y or -24) + pfUI_CoordsOffsetY)
+			end
+		end
+	end
+
+	local origShow = DMV_ShowFrames
+	DMV_ShowFrames = function(...)
+		origShow(...)
+		ApplypfUISkinOnce()
+		SkinCustomList(DMV_AreaList)
+	end
+
 	local origToggleMarkerList = DMV_ToggleMarkerList
 	if origToggleMarkerList then
 		DMV_ToggleMarkerList = function()
 			origToggleMarkerList()
+			SkinCustomList(DMV_MarkerList)
 			if DMV_MarkerList and DMV_MarkerList:IsShown() then
 				local point, relTo, relPoint, x, y = DMV_MarkerList:GetPoint()
 				DMV_MarkerList:SetPoint(point, relTo, relPoint, x or 0, (y or 0) + pfUI_MenuOffsetY)
@@ -461,28 +494,11 @@ local function DMV_ApplypfUICompat()
 	if origToggleAreaList then
 		DMV_ToggleAreaList = function()
 			origToggleAreaList()
+			SkinCustomList(DMV_AreaList)
 			if DMV_AreaList and DMV_AreaList:IsShown() then
 				local point, relTo, relPoint, x, y = DMV_AreaList:GetPoint()
 				DMV_AreaList:SetPoint(point, relTo, relPoint, x or 0, (y or 0) + pfUI_MenuOffsetY)
 			end
-		end
-	end
-
-	local pfUI_CoordsOffsetY = -5
-
-	if DMV_CoordsFrame then
-		local point, relTo, relPoint, x, y = DMV_CoordsFrame:GetPoint()
-		if point then
-			DMV_CoordsFrame:ClearAllPoints()
-			DMV_CoordsFrame:SetPoint(point, relTo, relPoint, x or 10, (y or -24) + pfUI_CoordsOffsetY)
-		end
-	end
-
-	if DMV_PlayerCoordsFrame then
-		local point, relTo, relPoint, x, y = DMV_PlayerCoordsFrame:GetPoint()
-		if point then
-			DMV_PlayerCoordsFrame:ClearAllPoints()
-			DMV_PlayerCoordsFrame:SetPoint(point, relTo, relPoint, x or -10, (y or -24) + pfUI_CoordsOffsetY)
 		end
 	end
 
