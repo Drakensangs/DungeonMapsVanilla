@@ -7,6 +7,7 @@ DungeonMapsVanilla is an addon that adds functional dungeon & raid maps to the g
 
  - functional player arrow
  - toggleable party/raid member blips
+ - party/raid blips of players who also have the addon installed are correctly shown regardless of distance and are properly hidden/revealed when they change floors 
  - working floor transitions
  - WotLK style Areas dropdown menu to switch between floors
  - toggleable boss, quest, loot & object markers that can be repositioned or removed in-game
@@ -24,8 +25,7 @@ Regarding compatibility, I haven't tested any world map altering addons other th
 
 ## Known Limitations
 
- - party/raid member blips disappear if there's a distance of over 100 yards or so between you and them
- - party/raid member blips will will show between dungeon/raid floors, so for example if you're on floor 1 of a dungeon and the rest of your party is on floor 2, you'll see their positions bleeding into your floor; tried working around this, but I just couldn't find a 100% solid fix for it
+ - players who do NOT have the addon installed will still have their party/raid blips shown, however, they will appear between floors and be hidden past a distance of 100 yards or so
  - if your game or system crashes while you're inside a dungeon, the addon won't be able to save your last known floor location; this can be easily fixed by opening the Areas dropdown menu and shift clicking the floor you're on
 
 ## 👨‍💻 **Author**
