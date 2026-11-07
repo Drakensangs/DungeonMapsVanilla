@@ -1,4 +1,5 @@
 --frFR
+local L = DMV_L
 
 --Zones
 --Les Mortemines
@@ -90,8 +91,8 @@ L["The Construct Quarter"] = "Le quartier des Assemblages"
 L["The Arachnid Quarter"] = "Le quartier des Arachnides"
 L["The Military Quarter"] = "Le quartier Militaire"
 L["The Plague Quarter"] = "Le quartier de la Peste"
-L["The Lower Necropolis"] = "Partie inférieure de la nécropole""
-L["The Upper Necropolis"] = "Partie supérieure de la nécropole""
+L["The Lower Necropolis"] = "Partie inférieure de la nécropole"
+L["The Upper Necropolis"] = "Partie supérieure de la nécropole"
 L["Sapphiron's Lair"] = "Repaire de Saphiron"
 
 L["Ragefire Chasm"] = "Gouffre de Ragefeu"
@@ -128,7 +129,7 @@ L["Arrow"] = "affiche la position actuelle de la flèche du joueur"
 L["Calib"] = "activer ou désactiver le calibrage des marqueurs"
 L["Calib On"] = "|cff00ff00DMV|r : Calibration |cff00ff00ACTIVÉE|r : faites glisser les marqueurs à la position souhaitée (enregistrement automatique). Utilisez |cffffff00/dmv calib reset|r pour réinitialiser"
 L["Calib Off"] = "|cff00ff00DMV|r : Calibration |cffff0000DÉSACTIVÉE|r"
-L["Calib Reset1"] = "efface toutes les modifications personnalisées des marqueurs"
+L["Calib Reset1"] = "efface les modifications personnalisées des marqueurs de l’instance actuelle"
 L["Calib Reset2"] = "|cff00ff00DMV|r : modifications de calibration effacées pour cette instance"
 L["Commands"] = "|cffffff00Commandes :|r"
 L["Marker remove"] = "Ctrl+Clic pour supprimer"
@@ -167,3 +168,6 @@ L["The Lost Dwarves"] = "Les nains perdus"
 L["The Seven Dwarves"] = "Les sept nains"
 L["Edge of Madness"] = "Frontière de la folie"
 L["Rare Elite"] = "Rare élite"
+
+--Coordonnées
+L["Cursor"] = "Curseur"

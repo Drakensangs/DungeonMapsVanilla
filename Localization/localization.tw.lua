@@ -1,4 +1,5 @@
 --zhTW
+local L = DMV_L
 
 --區域
 --死亡礦坑
@@ -128,7 +129,7 @@ L["Arrow"] = "輸出目前玩家箭頭的位置"
 L["Calib"] = "切換標記校準模式"
 L["Calib On"] = "|cff00ff00DMV|r：校準 |cff00ff00開啟|r：將標記拖曳至所需位置（自動儲存）。輸入 |cffffff00/dmv calib reset|r 可清除"
 L["Calib Off"] = "|cff00ff00DMV|r：校準 |cffff0000關閉|r"
-L["Calib Reset1"] = "清除所有標記覆寫設定"
+L["Calib Reset1"] = "清除目前副本的標記覆寫設定"
 L["Calib Reset2"] = "|cff00ff00DMV|r：已清除此副本的校準覆寫設定"
 L["Commands"] = "|cffffff00指令：|r"
 L["Marker remove"] = "Ctrl+點擊以移除"
@@ -167,3 +168,6 @@ L["The Lost Dwarves"] = "失蹤的矮人"
 L["The Seven Dwarves"] = "七賢人"
 L["Edge of Madness"] = "瘋狂之緣"
 L["Rare Elite"] = "稀有精英"
+
+--座標
+L["Cursor"] = "游標"

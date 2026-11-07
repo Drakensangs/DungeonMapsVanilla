@@ -1,4 +1,5 @@
 --esES
+local L = DMV_L
 
 --Áreas
 --Las Minas de la Muerte
@@ -90,7 +91,7 @@ L["The Construct Quarter"] = "Ala de Abominación"
 L["The Arachnid Quarter"] = "Ala Arácnida"
 L["The Military Quarter"] = "Ala Militar"
 L["The Plague Quarter"] = "Ala de la Plaga"
-L["The Lower Necropolis"] = "La Necrópolis Inferior""
+L["The Lower Necropolis"] = "La Necrópolis Inferior"
 L["The Upper Necropolis"] = "La Necrópolis Superior"
 L["Sapphiron's Lair"] = "Sala Vermis Gélida"
 
@@ -128,7 +129,7 @@ L["Arrow"] = "muestra la posición actual de la flecha del jugador"
 L["Calib"] = "activar o desactivar la calibración de marcadores"
 L["Calib On"] = "|cff00ff00DMV|r: Calibración |cff00ff00ACTIVADA|r: arrastra los marcadores hasta la posición deseada (guardado automático). Usa |cffffff00/dmv calib reset|r para restablecer"
 L["Calib Off"] = "|cff00ff00DMV|r: Calibración |cffff0000DESACTIVADA|r"
-L["Calib Reset1"] = "borra todas las modificaciones personalizadas de los marcadores"
+L["Calib Reset1"] = "borra las modificaciones personalizadas de los marcadores de la instancia actual"
 L["Calib Reset2"] = "|cff00ff00DMV|r: modificaciones de calibración eliminadas para esta instancia"
 L["Commands"] = "|cffffff00Comandos:|r"
 L["Marker remove"] = "Ctrl+clic para eliminar"
@@ -167,3 +168,6 @@ L["The Lost Dwarves"] = "Los enanos desaparecidos"
 L["The Seven Dwarves"] = "Los Siete Enanitos"
 L["Edge of Madness"] = "Extremo de la Locura"
 L["Rare Elite"] = "Élite raro"
+
+--Coordenadas
+L["Cursor"] = "Cursor"

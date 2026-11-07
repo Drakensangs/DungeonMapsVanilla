@@ -1,5 +1,7 @@
 -- DungeonData.lua
 
+local L = DMV_L
+
 -- Each entry: { folderName, displayName[, isRaid=true] }
 -- folderName  : folder containing the map's textures
 -- displayName : shown in the world map zone dropdown
@@ -566,7 +568,7 @@ DMV_Markers = {
 		{ "n15370", 69.1, 54.65, 1, "TheRuinsofAhnQiraj", 15 },
 		{ "n15369", 61, 79.2, 1, "TheRuinsofAhnQiraj", 16 },
 		{ "n15339", 42.6, 60.95, 1, "TheRuinsofAhnQiraj", 17 },
-		{ 'E L L["Trash Mobs"]', 98, 1.4, {1, 2, 3}, "TheRuinsofAhnQiraj", 20 },
+		{ 'E L L["Trash Mobs"]', 98, 1.4, 1, "TheRuinsofAhnQiraj", 20 },
 	},
 	[531] = {
 		{ "n15263", 45.3, 45.3, 1, "TheTempleofAhnQiraj", 3 },
@@ -721,12 +723,16 @@ DMV_FloorTransitions = {
 		{ fromFloor=2, toFloor=1, subzone=L["The Dormitory"], subzoneMode="condition", x=-618.5, xDir="lt", yMin=120, yMax=130 },
 		{ fromFloor=1, toFloor=2, subzone=L["The Dormitory"], subzoneMode="condition", x=-619, xDir="gt", yMin=88, yMax=99 },
 		{ fromFloor=2, toFloor=1, subzone=L["The Dormitory"], subzoneMode="condition", x=-619, xDir="lt", yMin=88, yMax=99 },
-		{ fromFloor=1, toFloor=3, x=-733.6360, xDir="eq", y=1.8684, yDir="eq" },
+		{ toFloor=3, x=-733.6360, xDir="eq", y=1.8684, yDir="eq" },
+		{ toFloor=3, x=-734.8, xDir="lt", yMin=-8, yMax=10, zMin=-251, zMax=236 },
 	},
 	[189] = {
 		{ toFloor=2, x=253.6720, xDir="eq", y=-206.6240, yDir="eq" },
+		{ toFloor=2, y=-206.63, yDir="lt", xMin=250, xMax=257 },
 		{ toFloor=3, x=1608.1000, xDir="eq", y=-318.9190, yDir="eq" },
+		{ toFloor=3, y=-318.93, yDir="lt", xMin=1603, xMax=1612 },
 		{ toFloor=4, x=853.1790, xDir="eq", y=1319.1801, yDir="eq" },
+		{ toFloor=4, y=1319.2, yDir="gt", xMin=848, xMax=857 },
 	},
 	[70] = {
 		{ fromFloor=1, toFloor=2, subzone=L["Hall of the Crafters"], subzoneMode="condition", x=137.7, xDir="lt", yMin=220, yMax=240 },
@@ -837,14 +843,19 @@ DMV_FloorTransitions = {
 	},
 	[429] = {
 		{ toFloor=5, x=-203.1660, xDir="eq", y=-322.9970, yDir="eq" },
+		{ toFloor=5, y=-323.3, yDir="lt", xMin=-209, xMax=-196, zMin=-4, zMax=8 },
 		{ toFloor=5, x=47.4501, xDir="eq", y=-153.6650, yDir="eq" },
+		{ toFloor=5, y=-159.3, yDir="lt", xMin=42, xMax=65, zMin=-4, zMax=35 },
 		{ toFloor=5, x=10.5786, xDir="eq", y=-836.9910, yDir="eq" },
+		{ toFloor=5, x=11, xDir="gt", yMin=-841, yMax=832, zMin=-34, zMax=-19 },
 		{ fromFloor=5, toFloor=6, y=-476.6, yDir="lt", xMin=-96, xMax=-75 },
 		{ fromFloor=6, toFloor=5, y=-476.6, yDir="gt", xMin=-96, xMax=-75 },
 		{ fromFloor=5, toFloor=6, subzone=L["The Conservatory"], subzoneMode="condition", z=-29.81975, zDir="lt" },
 		{ fromFloor=6, toFloor=5, subzone=L["The Conservatory"], subzoneMode="condition", z=-29.81975, zDir="gt" },
 		{ toFloor=2, x=33.1083, xDir="eq", y=158.9770, yDir="eq" },
+		{ toFloor=2, x=33.5, xDir="gt", yMin=150, yMax=168, zMin=-5, zMax=11 },
 		{ toFloor=2, x=-65.6559, xDir="eq", y=159.5610, yDir="eq" },
+		{ toFloor=2, y=163.67, yDir="gt", xMin=-84, xMax=-60, zMin=-5, zMax=47 },
 		{ fromFloor=2, toFloor=4, y=501, yDir="gt", xMin=42, xMax=58, zMin=-23.5, zMax=-12 },
 		{ fromFloor=4, toFloor=2, y=501, yDir="lt", xMin=42, xMax=58, zMin=-23.5, zMax=-12 },
 		{ fromFloor=4, toFloor=1, y=422.6, yDir="lt", xMin=170, xMax=183 },
@@ -858,6 +869,7 @@ DMV_FloorTransitions = {
 	},
 	[329] = {
 		{ toFloor=2, x=3590.8701, xDir="eq", y=-3643.2200, yDir="eq" },
+		{ toFloor=2, y=-3646, yDir="lt", xMin=3584, xMax=3600 },
 		{ fromFloor=2, toFloor=1, subzone=L["Festival Lane"] },
 		{ fromFloor=1, toFloor=2, subzone=L["Elders' Square"] },
 	},
@@ -890,8 +902,8 @@ DMV_FloorTransitions = {
 		{ fromFloor=4, toFloor=2, x=3006.89, xDir="gt", yMin=-3897, yMax=-3868 },
 		{ fromFloor=4, toFloor=3, y=-3436.1, yDir="gt", xMin=2542, xMax=2570 },
 		{ fromFloor=3, toFloor=4, y=-3436.1, yDir="lt", xMin=2542, xMax=2570 },
-		{ fromFloor=3, toFloor=1, x=3003.2, xDir="gt", yMin=-3000, yMax=2970 },
-		{ fromFloor=1, toFloor=3, x=3003.2, xDir="lt", yMin=-3000, yMax=2970 },
+		{ fromFloor=3, toFloor=1, x=3003.2, xDir="gt", yMin=-3000, yMax=-2970 },
+		{ fromFloor=1, toFloor=3, x=3003.2, xDir="lt", yMin=-3000, yMax=-2970 },
 		{ fromFloor=5, toFloor=1, x=3050.5, xDir="gt", yMin=-3400, yMax=-3339 },
 		{ fromFloor=1, toFloor=5, x=3050.5, xDir="lt", yMin=-3400, yMax=-3339 },
 		{ fromFloor=5, toFloor=4, x=2956.8, xDir="lt", yMin=-3505, yMax=-3465 },

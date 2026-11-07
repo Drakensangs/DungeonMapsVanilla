@@ -1,6 +1,8 @@
 --enUS
 
-L = {}
+-- Shared string table. DMV_L rather than a global L, which other addons may use.
+DMV_L = {}
+local L = DMV_L
 
 --Floors
 --The Deadmines
@@ -130,7 +132,7 @@ L["Arrow"] = "prints current player arrow position"
 L["Calib"] = "toggle marker calibration"
 L["Calib On"] = "|cff00ff00DMV|r: Calibration |cff00ff00ON|r: drag markers to the desired position (auto saved). |cffffff00/dmv calib reset|r to clear"
 L["Calib Off"] = "|cff00ff00DMV|r: Calibration |cffff0000OFF|r"
-L["Calib Reset1"] = "clear all marker overrides"
+L["Calib Reset1"] = "clear marker overrides for the current instance"
 L["Calib Reset2"] = "|cff00ff00DMV|r: calibration overrides cleared for this instance"
 L["Commands"] = "|cffffff00Commands:|r"
 L["Marker remove"] = "Ctrl+click to remove"
@@ -169,3 +171,6 @@ L["The Lost Dwarves"] = "The Lost Dwarves"
 L["The Seven Dwarves"] = "The Seven Dwarves"
 L["Edge of Madness"] = "Edge of Madness"
 L["Rare Elite"] = "Rare Elite"
+
+--Coordinates
+L["Cursor"] = "Cursor"

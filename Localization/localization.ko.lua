@@ -1,4 +1,5 @@
 --koKR
+local L = DMV_L
 
 --지역
 --죽음의 폐광
@@ -128,7 +129,7 @@ L["Arrow"] = "현재 플레이어 화살표 위치를 출력합니다"
 L["Calib"] = "마커 보정 모드 전환"
 L["Calib On"] = "|cff00ff00DMV|r: 보정 |cff00ff00켜짐|r: 마커를 원하는 위치로 드래그하세요 (자동 저장). 초기화하려면 |cffffff00/dmv calib reset|r 입력"
 L["Calib Off"] = "|cff00ff00DMV|r: 보정 |cffff0000꺼짐|r"
-L["Calib Reset1"] = "모든 마커 재정의 설정을 삭제합니다"
+L["Calib Reset1"] = "현재 인스턴스의 마커 재정의 설정을 삭제합니다"
 L["Calib Reset2"] = "|cff00ff00DMV|r: 현재 인스턴스의 보정 재정의 설정이 삭제되었습니다"
 L["Commands"] = "|cffffff00명령어:|r"
 L["Marker remove"] = "Ctrl+클릭하여 제거"
@@ -167,3 +168,6 @@ L["The Lost Dwarves"] = "길 잃은 드워프"
 L["The Seven Dwarves"] = "일곱 드워프 현자"
 L["Edge of Madness"] = "광란의 경계"
 L["Rare Elite"] = "희귀 정예"
+
+--좌표
+L["Cursor"] = "커서"

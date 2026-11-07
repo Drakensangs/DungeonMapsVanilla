@@ -1,4 +1,5 @@
 --zhCN
+local L = DMV_L
 
 --区域
 --死亡矿井
@@ -128,7 +129,7 @@ L["Arrow"] = "输出当前玩家箭头的位置"
 L["Calib"] = "切换标记校准模式"
 L["Calib On"] = "|cff00ff00DMV|r：校准 |cff00ff00开启|r：将标记拖动到所需位置（自动保存）。输入 |cffffff00/dmv calib reset|r 可清除"
 L["Calib Off"] = "|cff00ff00DMV|r：校准 |cffff0000关闭|r"
-L["Calib Reset1"] = "清除所有标记覆盖设置"
+L["Calib Reset1"] = "清除当前副本的标记覆盖设置"
 L["Calib Reset2"] = "|cff00ff00DMV|r：已清除此副本的校准覆盖设置"
 L["Commands"] = "|cffffff00命令：|r"
 L["Marker remove"] = "Ctrl+点击以移除"
@@ -167,3 +168,6 @@ L["The Lost Dwarves"] = "失踪的矮人"
 L["The Seven Dwarves"] = "七贤矮人"
 L["Edge of Madness"] = "疯狂之缘"
 L["Rare Elite"] = "稀有精英"
+
+--坐标
+L["Cursor"] = "光标"

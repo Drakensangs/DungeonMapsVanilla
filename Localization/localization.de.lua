@@ -1,4 +1,5 @@
 --deDE
+local L = DMV_L
 
 --Areale
 --Die Todesminen
@@ -90,8 +91,8 @@ L["The Construct Quarter"] = "Das Konstruktviertel"
 L["The Arachnid Quarter"] = "Das Arachnidenviertel"
 L["The Military Quarter"] = "Das Militärviertel"
 L["The Plague Quarter"] = "Das Seuchenviertel"
-L["The Lower Necropolis"] = "Die untere Nekropole""
-L["The Upper Necropolis"] = "Die obere Nekropole""
+L["The Lower Necropolis"] = "Die untere Nekropole"
+L["The Upper Necropolis"] = "Die obere Nekropole"
 L["Sapphiron's Lair"] = "Saphirons Hort"
 
 L["Ragefire Chasm"] = "Der Flammenschlund"
@@ -128,7 +129,7 @@ L["Arrow"] = "gibt die aktuelle Position des Spielerpfeils aus"
 L["Calib"] = "markerkalibrierung umschalten"
 L["Calib On"] = "|cff00ff00DMV|r: Kalibrierung |cff00ff00AN|r: Ziehe die Marker an die gewünschte Position (wird automatisch gespeichert). Mit |cffffff00/dmv calib reset|r zurücksetzen"
 L["Calib Off"] = "|cff00ff00DMV|r: Kalibrierung |cffff0000AUS|r"
-L["Calib Reset1"] = "alle Markerüberschreibungen löschen"
+L["Calib Reset1"] = "Markerüberschreibungen der aktuellen Instanz löschen"
 L["Calib Reset2"] = "|cff00ff00DMV|r: Kalibrierungsüberschreibungen für diese Instanz gelöscht"
 L["Commands"] = "|cffffff00Befehle:|r"
 L["Marker remove"] = "Strg+Klick zum Entfernen"
@@ -167,3 +168,6 @@ L["The Lost Dwarves"] = "Die verschollenen Zwerge"
 L["The Seven Dwarves"] = "Die Sieben Zwerge"
 L["Edge of Madness"] = "Rand des Wahnsinns"
 L["Rare Elite"] = "Seltenes Elite"
+
+--Koordinaten
+L["Cursor"] = "Cursor"

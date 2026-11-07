@@ -1,5 +1,6 @@
 -- DungeonMapsVanilla.lua
 
+local L = DMV_L
 local DMV_Frames = {}
 local DMV_Textures = {}
 local DMV_CurrentDungeon = nil
@@ -11,6 +12,7 @@ local DMV_Visible = false
 local DMV_ClickFrame = nil
 local DMV_Container = nil
 local DMV_BossPins = {}
+DMV_BossPinList = DMV_BossPins	-- read by DMV_Compat (Magnify mouse clipping)
 -- Cache for names resolved from IDs via ClassicAPI.
 -- Key: raw ID string e.g. "n11324", "o8417313", "q20183", "i19019"
 -- Value: resolved name string once loaded, or false while pending.
@@ -27,7 +29,7 @@ local DMV_ITEM_QUALITY_COLORS = {
 	[6] = "ffe6cc80", -- Artifact
 }
 
--- Format a resolved item cache entry { name, quality } as a colored [Name] string.
+-- Forward declarations (defined further down).
 local DMV_ResolveIDName
 local DMV_FormatItemText
 local DMV_FormatQuestText
@@ -49,11 +51,98 @@ local MAP_H = TILE_SIZE * MAP_ROWS  -- 768
 
 -- Player arrow
 local DMV_PlayerArrow = nil
-local DMV_PlayerArrowTicker = nil
 local ARROW_SIZE = 24
+local DMV_PlayerMapPosBuf = { x = 0, y = 0 }
 
-local function SafeShow(frame)
-	if frame then frame:Show() end
+-- Markers, member blips and the player arrow are frames that only handle
+-- the mouse (tooltips, clicks, calibration drags). They sit in the
+-- FULLSCREEN_DIALOG strata, above DMV_ClickFrame, at these levels above
+-- DMV_Container: markers < member blips < the player's own arrow.
+local PIN_LEVEL, BLIP_LEVEL, ARROW_LEVEL = 15, 18, 20
+
+-- Everything those frames show is drawn by one frame, DMV_OverlayDraw, in
+-- fixed draw layers. The client always draws a frame's layers in this
+-- order, so the stacking cannot depend on frame levels, which the 1.12
+-- client renumbers on its own ("compression") and which Magnify's scroll
+-- frame does not honour:
+--   BACKGROUND markers, BORDER marker hover glow, ARTWORK member blips,
+--   OVERLAY the player arrow (and the calibration labels).
+-- DMV_OverlayDraw keeps DMV_Container's strata (the world map's), so any
+-- window raised above the world map (Atlas, dropdown menus) is always
+-- drawn over the markers, blips and arrow.
+local DRAW_LEVEL = 15
+local DMV_OverlayDraw = nil
+
+local function DMV_GetOverlayDraw()
+	if DMV_OverlayDraw then return DMV_OverlayDraw end
+	local f = CreateFrame("Frame", "DMV_OverlayDraw", DMV_Container)
+	f:SetAllPoints(DMV_Container)
+	f:SetFrameLevel(DMV_Container:GetFrameLevel() + DRAW_LEVEL)
+	f:EnableMouse(false)
+	DMV_OverlayDraw = f
+	return f
+end
+
+-- A texture (or font string) drawn by DMV_OverlayDraw on top of `owner`.
+-- Textures cover the owner. Shown or hidden through DMV_BindImages.
+local function DMV_CreateOverlayRegion(owner, layer, isText)
+	local draw = DMV_GetOverlayDraw()
+	local r
+	if isText then
+		r = draw:CreateFontString(nil, layer, "GameFontNormalSmall")
+	else
+		r = draw:CreateTexture(nil, layer)
+		r:SetAllPoints(owner)
+	end
+	if not owner:IsShown() then r:Hide() end
+	return r
+end
+
+-- The images of a marker, blip or arrow frame follow the frame's own shown
+-- state: the frame's Show and Hide are wrapped (on that frame only), so
+-- every caller keeps both in step. onShow / onHide show and hide the
+-- images. The frame and DMV_OverlayDraw have the same parents, so a closed
+-- map hides both. OnShow/OnHide are not used for this: the client does not
+-- send OnHide to a frame that a script hides while its window is closing.
+local function DMV_BindImages(owner, onShow, onHide)
+	local show, hide = owner.Show, owner.Hide
+	owner.dmvImagesShown = owner:IsShown() and true or false
+	owner.Show = function(self)
+		show(self)
+		if not owner.dmvImagesShown then
+			owner.dmvImagesShown = true
+			onShow()
+		end
+	end
+	owner.Hide = function(self)
+		hide(self)
+		if owner.dmvImagesShown then
+			owner.dmvImagesShown = false
+			onHide()
+		end
+	end
+end
+
+-- Run `fn` after a frame script. ClassicAPI's intrinsic postcall binding
+-- survives other addons replacing the handler with SetScript; without it
+-- (older ClassicAPI) a plain HookScript is used. Returns true when the
+-- postcall binding was used.
+function DMV_HookScriptPost(frame, script, fn)
+	if LE_SCRIPT_BINDING_TYPE_INTRINSIC_POSTCALL then
+		frame:HookScript(script, fn, LE_SCRIPT_BINDING_TYPE_INTRINSIC_POSTCALL)
+		return true
+	end
+	frame:HookScript(script, fn)
+	return false
+end
+
+-- Report an error through the error handler instead of hiding it.
+local function DMV_SafeCall(fn)
+	local ok, err = pcall(fn)
+	if not ok then
+		local handler = geterrorhandler and geterrorhandler()
+		if handler then handler(err) end
+	end
 end
 
 local function GetContinentDropdown()
@@ -121,20 +210,35 @@ function DMV_GetTexturePath(dungeonName, floor, tileIndex)
 	return "Interface\\AddOns\\DungeonMapsVanilla\\Maps\\" .. dungeonName .. "\\" .. dungeonName .. floor .. "_" .. tileIndex
 end
 
--- Player arrow in dungeons and raids
--- Uses vanilla SetMapToCurrentZone() + GetPlayerMapPosition("player")
+-- Calibration readout for a point dx, dy (DMV_Container units from its top
+-- left). Markers use their own coordinate system (percent of the 1024x768
+-- tile grid x DMV_MapScale); the coordinate display and the arrow use percent
+-- of the visible canvas. Both are printed, labelled, so DungeonData values
+-- are not confused with the on-screen coordinates.
+local function DMV_CalibCoordsText(dx, dy)
+	local canvas = GetMapCanvas()
+	return string.format("marker x=%.1f, y=%.1f  (map x=%.1f, y=%.1f)",
+		dx / (MAP_W * DMV_MapScale) * 100, dy / (MAP_H * DMV_MapScale) * 100,
+		dx / canvas:GetWidth() * 100, dy / canvas:GetHeight() * 100)
+end
+
+-- Player arrow in dungeons and raids.
+-- Positioned from UnitPosition("player") and the floor's DMV_FloorMapRects entry
+-- (GetPlayerMapPosition returns 0,0 inside instances).
 local function DMV_CreatePlayerArrow()
 	if DMV_PlayerArrow then return end
 	if not DMV_Container then return end
 
+	-- Takes the mouse above the markers and member blips. Its image is in
+	-- DMV_OverlayDraw's top layer, so it is drawn on top of theirs.
 	local arrow = CreateFrame("Frame", "DMV_PlayerArrow", DMV_Container)
 	arrow:SetSize(ARROW_SIZE, ARROW_SIZE)
-	arrow:SetFrameLevel(DMV_Container:GetFrameLevel() + 20)
+	arrow:SetFrameStrata("FULLSCREEN_DIALOG")
+	arrow:SetFrameLevel(DMV_Container:GetFrameLevel() + ARROW_LEVEL)
 	arrow:Hide()
 
 	-- Arrow texture: use the minimap arrow atlas if available, else a fallback
-	local tex = arrow:CreateTexture(nil, "OVERLAY")
-	tex:SetAllPoints(arrow)
+	local tex = DMV_CreateOverlayRegion(arrow, "OVERLAY")
 
 	-- Try to use the MinimapArrow atlas (available via ClassicAPI's SetAtlas backport)
 	local ok = pcall(function() tex:SetAtlas("MinimapArrow", false) end)
@@ -148,235 +252,559 @@ local function DMV_CreatePlayerArrow()
 	arrow:EnableMouse(true)
 
 	arrow:SetScript("OnEnter", function()
-		local x, y = arrow:GetCenter()
-		local parentX = DMV_Container:GetCenter()
-		if x > parentX then
-			WorldMapTooltip:SetOwner(arrow, "ANCHOR_LEFT")
-		else
-			WorldMapTooltip:SetOwner(arrow, "ANCHOR_RIGHT")
-		end
-		WorldMapTooltip:SetText(UnitName("player"))
-		WorldMapTooltip:Show()
+		arrow.hovered = true
+		DMV_ShowUnitTooltip(arrow)
 	end)
 
 	arrow:SetScript("OnLeave", function()
+		arrow.hovered = false
 		WorldMapTooltip:Hide()
+	end)
+	DMV_BindImages(arrow, function() tex:Show() end, function() tex:Hide() end)
+	arrow:SetScript("OnHide", function()
+		if arrow.hovered then
+			arrow.hovered = false
+			WorldMapTooltip:Hide()
+		end
 	end)
 
 	DMV_PlayerArrow = arrow
+	-- Keeps the mouse order and Atlas on top (both defined below).
+	DMV_ApplyOverlayLevels()
+end
+
+-- Instance cache: the instance can only change behind a loading screen, so
+-- GetInstanceInfo() is read once per PLAYER_ENTERING_WORLD instead of every
+-- frame. Until the first refresh it is read live.
+local DMV_InstCacheValid, DMV_InstCacheType, DMV_InstCacheMapID = false, nil, nil
+
+function DMV_RefreshInstanceCache()
+	local _, instanceType, _, _, _, _, _, instanceMapID = GetInstanceInfo()
+	DMV_InstCacheType, DMV_InstCacheMapID = instanceType, instanceMapID
+	DMV_InstCacheValid = true
+end
+
+-- Returns instanceType, instanceMapID.
+function DMV_GetInstanceCached()
+	if not DMV_InstCacheValid then DMV_RefreshInstanceCache() end
+	return DMV_InstCacheType, DMV_InstCacheMapID
+end
+
+-- Forget the player's map position. Called on every path that does not draw
+-- the arrow (another floor, preview, map closed, off the map), so the player
+-- coordinates never keep showing an old value.
+local function DMV_ClearPlayerMapPos()
+	DMV_LastPlayerMapPos = nil
+end
+
+-- Atlas opened from a marker is raised to FULLSCREEN_DIALOG, the strata of
+-- DMV's mouse frames. Raise it above them again whenever DMV moves or adds
+-- one, so the mouse over the Atlas window goes to Atlas, not to a marker
+-- under it. Only while the Atlas window DMV opened is shown, and only when
+-- one of DMV's frames is not already below it: every Raise makes the client
+-- re-sort the strata, and this also runs on every world map update.
+local DMV_RAISE_CONTROLS = {
+	"DMV_ClickFrame", "DMV_LevelDropDown", "DMV_LevelDropDownButton",
+	"DMV_LevelUpButton", "DMV_LevelDownButton",
+	"DMV_BossPinDropDown", "DMV_BossPinDropDownButton",
+}
+
+local function DMV_AboveLevel(f, level)
+	return f and f:GetFrameStrata() == "FULLSCREEN_DIALOG" and f:GetFrameLevel() >= level
+end
+
+local function DMV_AnyFrameAbove(level)
+	if DMV_AboveLevel(DMV_PlayerArrow, level) then return true end
+	for i = 1, table.getn(DMV_PartyBlips) do
+		if DMV_AboveLevel(DMV_PartyBlips[i], level) then return true end
+	end
+	for _, pin in pairs(DMV_BossPins) do
+		if DMV_AboveLevel(pin, level) then return true end
+	end
+	for i = 1, table.getn(DMV_RAISE_CONTROLS) do
+		if DMV_AboveLevel(getglobal(DMV_RAISE_CONTROLS[i]), level) then return true end
+	end
+	return false
+end
+
+function DMV_RaiseAtlas()
+	local af = AtlasFrame
+	if af and af.DMV_OnTop and af.Raise and af:IsVisible()
+		and DMV_AnyFrameAbove(af:GetFrameLevel()) then
+		af:Raise()
+	end
+end
+
+-- Put the marker, member blip and player arrow frames back at their levels
+-- above DMV_Container (they decide which one gets the mouse). On the 1.12
+-- client SetFrameStrata also moves a frame back to its parent's level + 1.
+-- Only levels that differ are set: every change makes the client re-sort
+-- the strata.
+local function DMV_SetLevel(f, level)
+	if f:GetFrameLevel() ~= level then f:SetFrameLevel(level) end
+end
+
+-- True while the mouse order still holds: DMV_ClickFrame < every marker <
+-- every member blip < the player arrow. The client may renumber levels on
+-- its own (keeping their order); that must not be undone on every map
+-- update, or each update would push DMV above a raised Atlas window again.
+local function DMV_OverlayLevelsInOrder()
+	local below = -1
+	local click = DMV_ClickFrame
+	if click and click:GetFrameStrata() == "FULLSCREEN_DIALOG" then below = click:GetFrameLevel() end
+	local top = below
+	for _, pin in pairs(DMV_BossPins) do
+		local l = pin:GetFrameLevel()
+		if l <= below then return false end
+		if l > top then top = l end
+	end
+	below = top
+	for i = 1, table.getn(DMV_PartyBlips) do
+		local l = DMV_PartyBlips[i]:GetFrameLevel()
+		if l <= below then return false end
+		if l > top then top = l end
+	end
+	if DMV_PlayerArrow and DMV_PlayerArrow:GetFrameLevel() <= top then return false end
+	return true
+end
+
+function DMV_ApplyOverlayLevels()
+	local c = DMV_Container
+	if not c then return end
+	if DMV_OverlayLevelsInOrder() then
+		DMV_RaiseAtlas()
+		return
+	end
+	local base = c:GetFrameLevel()
+	for _, pin in pairs(DMV_BossPins) do DMV_SetLevel(pin, base + PIN_LEVEL) end
+	for i = 1, table.getn(DMV_PartyBlips) do DMV_SetLevel(DMV_PartyBlips[i], base + BLIP_LEVEL) end
+	if DMV_PlayerArrow then DMV_SetLevel(DMV_PlayerArrow, base + ARROW_LEVEL) end
+	DMV_RaiseAtlas()
+end
+
+local function DMV_HidePlayerArrow()
+	DMV_ClearPlayerMapPos()
+	if DMV_PlayerArrow then DMV_PlayerArrow:Hide() end
 end
 
 function DMV_UpdatePlayerArrow()
-	if not DMV_PlayerArrow then return end
-	if not DMV_Container then return end
-	if not DMV_CurrentDungeon then DMV_PlayerArrow:Hide(); return end
-	if DMV_PreviewMode then DMV_PlayerArrow:Hide(); return end
-	if DMV_CurrentFloor ~= DMV_ActualFloor then DMV_PlayerArrow:Hide(); return end
+	local arrow = DMV_PlayerArrow
+	if not arrow or not DMV_Container then return end
+	if not DMV_Visible or not DMV_CurrentDungeon or DMV_PreviewMode then DMV_HidePlayerArrow(); return end
+
+	local _, instanceMapID = DMV_GetInstanceCached()
+	if not instanceMapID then DMV_HidePlayerArrow(); return end
+
+	-- Drawn on the player's own floor, and on an overview floor whose map
+	-- also covers it (Naxxramas floor 5), as member blips are.
+	if DMV_CurrentFloor ~= DMV_ActualFloor
+	   and not (DMV_FS and DMV_FS.FloorVisibleOn
+				and DMV_FS.FloorVisibleOn(instanceMapID, DMV_ActualFloor, DMV_CurrentFloor)) then
+		DMV_HidePlayerArrow(); return
+	end
 
 	local posY, posX = UnitPosition("player")
-	if not posY or not posX then DMV_PlayerArrow:Hide(); return end
-
-	local _, _, _, _, _, _, _, instanceMapID = GetInstanceInfo()
-	if not instanceMapID then DMV_PlayerArrow:Hide(); return end
+	if not posY or not posX then DMV_HidePlayerArrow(); return end
 
 	local floorRects = DMV_FloorMapRects and DMV_FloorMapRects[instanceMapID]
 	local rect = floorRects and floorRects[DMV_CurrentFloor]
-	if not rect or not rect.locLeft then DMV_PlayerArrow:Hide(); return end
+	if not rect or not rect.locLeft then DMV_HidePlayerArrow(); return end
 
 	local width  = rect.locLeft - rect.locRight
 	local height = rect.locTop  - rect.locBottom
 
-	if width == 0 or height == 0 then DMV_PlayerArrow:Hide(); return end
+	if width == 0 or height == 0 then DMV_HidePlayerArrow(); return end
 
 	local mapX = (rect.locLeft - posY) / width  * 100
 	local mapY = (rect.locTop  - posX) / height * 100
 
-	-- Expose for third-party addons (e.g. Magnify player coordinate display).
-	DMV_LastPlayerMapPos = { x = mapX, y = mapY }
-
 	if mapX < 0 or mapX > 100 or mapY < 0 or mapY > 100 then
-		DMV_LastPlayerMapPos = nil
-		DMV_PlayerArrow:Hide(); return
+		DMV_HidePlayerArrow(); return
 	end
 
-	-- Write directly into Magnify's player coordinate display if present.
-	-- Magnify's updater uses GetPlayerMapPosition which returns 0,0 in instances.
-	if MagnifyPlayerFrame and MagnifyPlayerFrame.text then
-		MagnifyPlayerFrame.text:SetText(string.format("Player: %.1f / %.1f", mapX, mapY))
-	end
+	-- Read by DMV's player coordinate display and by third-party addons.
+	-- One table is reused because this runs every frame while the map is open.
+	DMV_PlayerMapPosBuf.x = mapX
+	DMV_PlayerMapPosBuf.y = mapY
+	DMV_LastPlayerMapPos = DMV_PlayerMapPosBuf
 
-	-- Use the actual canvas size for pixel placement.
-	-- The map tiles (1024x768) are scaled to fit WorldMapDetailFrame (1002x668).
+	-- No frame level is set here. The arrow's image is in DMV_OverlayDraw's
+	-- top layer, and setting a level every frame fought the client's own
+	-- level renumbering (Atlas window lag, arrow over Atlas).
+
+	-- Map percentages are relative to the visible canvas (WorldMapDetailFrame,
+	-- 1002x668); the 1024x768 tile grid overhangs it, as stock map tiles do.
 	local canvas = GetMapCanvas()
-	local canvasW = canvas:GetWidth()
-	local canvasH = canvas:GetHeight()
+	local px =  (mapX / 100) * canvas:GetWidth()
+	local py = -(mapY / 100) * canvas:GetHeight()
 
-	local px =  (mapX / 100) * canvasW
-	local py = -(mapY / 100) * canvasH
-
-	DMV_PlayerArrow:ClearAllPoints()
-	DMV_PlayerArrow:SetPoint("CENTER", DMV_Container, "TOPLEFT", px, py)
+	-- Anchor and rotation are only touched when they change.
+	if not arrow.px or math.abs(px - arrow.px) > 0.01 or math.abs(py - arrow.py) > 0.01 then
+		arrow:ClearAllPoints()
+		arrow:SetPoint("CENTER", DMV_Container, "TOPLEFT", px, py)
+		arrow.px, arrow.py = px, py
+	end
 
 	local facing = GetPlayerFacing and GetPlayerFacing() or 0
-	if DMV_PlayerArrow.tex.SetRotation then
-		DMV_PlayerArrow.tex:SetRotation(facing)
+	if facing ~= arrow.facing and arrow.tex.SetRotation then
+		arrow.tex:SetRotation(facing)
+		arrow.facing = facing
 	end
 
-	DMV_PlayerArrow:Show()
+	arrow:Show()
 end
 
 -- Party member blips
 DMV_PartyBlips = {}
-BLIP_SIZE = 8
+DMV_BLIP_SIZE = 8
 
 local BLIP_TEX_PARTY = "Interface\\AddOns\\DungeonMapsVanilla\\Assets\\partymember"
 local BLIP_TEX_RAID  = "Interface\\AddOns\\DungeonMapsVanilla\\Assets\\raidmember"
+-- Member blips are fully refreshed (roster, names, floors, textures,
+-- visibility) at 20 Hz. In between, the blips already shown only follow
+-- their members' positions (DMV_MovePartyBlips), every frame like the arrow.
+local BLIP_REFRESH   = 0.05
+local BLIP_MOVE_EPS  = 0.1	-- re-anchor a blip only after it moved this many screen pixels
+local DMV_BlipElapsed = 0	-- time since the last blip refresh
+
+-- Set by the last full refresh, read by DMV_MovePartyBlips: the number of
+-- blip slots in use and the floor rect / canvas size they were placed with.
+local DMV_BlipMoveCount = 0
+local DMV_BlipLocLeft, DMV_BlipLocTop, DMV_BlipW, DMV_BlipH = 0, 0, 1, 1
+local DMV_BlipCanvasW, DMV_BlipCanvasH, DMV_BlipEps = 0, 0, BLIP_MOVE_EPS
+
+-- Unit tokens and per-frame work lists, built once and reused every frame.
+local DMV_RAID_UNITS, DMV_PARTY_UNITS = {}, {}
+for i = 1, 40 do DMV_RAID_UNITS[i] = "raid" .. i end
+for i = 1, 4 do DMV_PARTY_UNITS[i] = "party" .. i end
+local DMV_BlipUnits, DMV_BlipSameParty, DMV_RaidSubgroups = {}, {}, {}
+-- Class per unit token. A token only changes owner on a roster change, so
+-- this is cleared on every roster refresh; unknown classes are retried.
+local DMV_UnitClassCache = {}
+
+-- Raid roster cache: subgroups and the player's own row are re-read only when
+-- the roster changes (RAID_ROSTER_UPDATE / PARTY_MEMBERS_CHANGED / entering
+-- the world), not every frame while the map is open.
+local DMV_RosterDirty = true
+local DMV_RosterNumRaid, DMV_RosterPlayerIndex, DMV_RosterPlayerSubgroup = 0, nil, nil
+
+local function DMV_RefreshRosterCache()
+	local numRaid = GetNumRaidMembers()
+	local playerName = UnitName("player")
+	local playerIndex, playerSubgroup = nil, nil
+	for i = 1, numRaid do
+		local name, _, subgroup = GetRaidRosterInfo(i)
+		DMV_RaidSubgroups[i] = subgroup
+		-- Unit tokens can lag behind the roster while it is being rebuilt, so
+		-- the roster name is checked as well.
+		if not playerIndex and (UnitIsUnit(DMV_RAID_UNITS[i], "player")
+				or (name and name == playerName)) then
+			playerIndex, playerSubgroup = i, subgroup
+		end
+	end
+	for i = numRaid + 1, 40 do DMV_RaidSubgroups[i] = nil end
+	for k in pairs(DMV_UnitClassCache) do DMV_UnitClassCache[k] = nil end
+	DMV_RosterNumRaid = numRaid
+	DMV_RosterPlayerIndex, DMV_RosterPlayerSubgroup = playerIndex, playerSubgroup
+	-- Without the player's own row every member would get the raid texture
+	-- and the player a blip under the arrow: read the roster again next time.
+	DMV_RosterDirty = numRaid > 0 and not playerIndex
+end
+
+local DMV_RosterEventFrame = CreateFrame("Frame", "DMV_RosterEventFrame")
+DMV_RosterEventFrame:RegisterEvent("RAID_ROSTER_UPDATE")
+DMV_RosterEventFrame:RegisterEvent("PARTY_MEMBERS_CHANGED")
+DMV_RosterEventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
+DMV_RosterEventFrame:SetScript("OnEvent", function()
+	DMV_RosterDirty = true
+	DMV_BlipElapsed = BLIP_REFRESH	-- redraw the blips on the next frame
+end)
+
+-- Tooltip listing every group member under the cursor (player arrow
+-- included), as the stock world map does for stacked party members.
+function DMV_ShowUnitTooltip(owner)
+	local text
+	local arrow = DMV_PlayerArrow
+	if arrow and arrow:IsVisible() and (arrow == owner or (MouseIsOver and MouseIsOver(arrow))) then
+		text = UnitName("player")
+	end
+	for i = 1, table.getn(DMV_PartyBlips) do
+		local blip = DMV_PartyBlips[i]
+		if blip:IsVisible() and blip.name
+		   and (blip == owner or (MouseIsOver and MouseIsOver(blip))) then
+			text = text and (text .. "\n" .. blip.name) or blip.name
+		end
+	end
+	if not text then WorldMapTooltip:Hide(); return end
+	local x = owner:GetCenter()
+	local parentX = DMV_Container:GetCenter()
+	WorldMapTooltip:SetOwner(owner, (x and parentX and x > parentX) and "ANCHOR_LEFT" or "ANCHOR_RIGHT")
+	WorldMapTooltip:SetText(text)
+	WorldMapTooltip:Show()
+end
 
 local function DMV_GetOrCreateBlip(i)
 	if DMV_PartyBlips[i] then return DMV_PartyBlips[i] end
 	if not DMV_Container then return nil end
 
+	-- Takes the mouse above the markers (container +15), below the player
+	-- arrow (+20). Its image is in DMV_OverlayDraw's ARTWORK layer.
 	local blip = CreateFrame("Frame", "DMV_PartyBlip"..i, DMV_Container)
-	blip:SetSize(BLIP_SIZE, BLIP_SIZE)
+	blip:SetSize(DMV_BLIP_SIZE, DMV_BLIP_SIZE)
 	blip:SetFrameStrata("FULLSCREEN_DIALOG")
+	blip:SetFrameLevel(DMV_Container:GetFrameLevel() + BLIP_LEVEL)
 	blip:Hide()
 
-	local tex = blip:CreateTexture(nil, "OVERLAY")
-	tex:SetAllPoints(blip)
+	local tex = DMV_CreateOverlayRegion(blip, "ARTWORK")
 	tex:SetTexture(BLIP_TEX_PARTY)
 	blip.tex = tex
 
 	blip:EnableMouse(true)
 	blip:SetScript("OnEnter", function()
-		if blip.unit then
-			WorldMapTooltip:SetOwner(blip, "ANCHOR_RIGHT")
-			WorldMapTooltip:SetText(UnitName(blip.unit) or "")
-			WorldMapTooltip:Show()
+		blip.hovered = true
+		DMV_ShowUnitTooltip(blip)
+	end)
+	blip:SetScript("OnLeave", function()
+		blip.hovered = false
+		WorldMapTooltip:Hide()
+	end)
+	DMV_BindImages(blip, function() tex:Show() end, function() tex:Hide() end)
+	blip:SetScript("OnHide", function()
+		blip.live = false
+		if blip.hovered then
+			blip.hovered = false
+			WorldMapTooltip:Hide()
 		end
 	end)
-	blip:SetScript("OnLeave", function() WorldMapTooltip:Hide() end)
 
 	DMV_PartyBlips[i] = blip
+	DMV_ApplyOverlayLevels()
 	return blip
+end
+
+local function DMV_HideBlips(fromIndex)
+	fromIndex = fromIndex or 1
+	for i = fromIndex, table.getn(DMV_PartyBlips) do
+		local blip = DMV_PartyBlips[i]
+		blip.live = false
+		blip:Hide()
+	end
+	if DMV_BlipMoveCount >= fromIndex then DMV_BlipMoveCount = fromIndex - 1 end
+end
+
+-- Between full refreshes: move the blips that are shown from the client's
+-- own position of their member (live). Nothing else is read or changed, so
+-- this costs one UnitPosition per shown blip, and a re-anchor only when it
+-- moved. Blips placed from a DMV broadcast are left to the full refresh
+-- (broadcasts arrive at most once a second).
+local function DMV_MovePartyBlips()
+	local n = DMV_BlipMoveCount
+	if n == 0 then return end
+	local left, top, width, height = DMV_BlipLocLeft, DMV_BlipLocTop, DMV_BlipW, DMV_BlipH
+	local canvasW, canvasH, moveEps = DMV_BlipCanvasW, DMV_BlipCanvasH, DMV_BlipEps
+	local abs = math.abs
+	for i = 1, n do
+		local blip = DMV_PartyBlips[i]
+		if blip and blip.live then
+			local posY, posX = UnitPosition(blip.unit)
+			if posY and posX then
+				-- Same arithmetic as the full refresh.
+				local mapX = (left - posY) / width  * 100
+				local mapY = (top  - posX) / height * 100
+				if mapX >= 0 and mapX <= 100 and mapY >= 0 and mapY <= 100 then
+					local px, py = (mapX / 100) * canvasW, -(mapY / 100) * canvasH
+					if abs(px - blip.px) > moveEps or abs(py - blip.py) > moveEps then
+						blip:ClearAllPoints()
+						blip:SetPoint("CENTER", DMV_Container, "TOPLEFT", px, py)
+						blip.px, blip.py = px, py
+					end
+				end
+			end
+		end
+	end
 end
 
 function DMV_UpdatePartyBlips()
 	if not DMV_Container then return end
+	if not DMV_Visible or not DMV_CurrentDungeon or DMV_PreviewMode then DMV_HideBlips(); return end
 	local showParty = not (DMV_Settings and DMV_Settings.showPartyBlips == false)
 	local showRaid  = not (DMV_Settings and DMV_Settings.showRaidBlips  == false)
-	if not showParty and not showRaid then
-		for i = 1, 40 do if DMV_PartyBlips[i] then DMV_PartyBlips[i]:Hide() end end
-		return
-	end
-	if not DMV_CurrentDungeon or DMV_PreviewMode then
-		for i = 1, 40 do if DMV_PartyBlips[i] then DMV_PartyBlips[i]:Hide() end end
-		return
-	end
-	if DMV_CurrentFloor ~= DMV_ActualFloor then
-		for i = 1, 40 do if DMV_PartyBlips[i] then DMV_PartyBlips[i]:Hide() end end
-		return
-	end
+	if not showParty and not showRaid then DMV_HideBlips(); return end
 
-	local _, _, _, _, _, _, _, instanceMapID = GetInstanceInfo()
-	if not instanceMapID then return end
+	-- Without the floor-sync module the old rule applies: members are only
+	-- drawn while the player views their own floor. With it, each member is
+	-- drawn on the floor they are known to be on (see DMV_FloorSync.lua).
+	local shouldShow = DMV_FS_ShouldShowUnit
+	local syncedPos = DMV_FS_GetSyncedPosition
+	if not shouldShow and DMV_CurrentFloor ~= DMV_ActualFloor then DMV_HideBlips(); return end
+
+	local _, instanceMapID = DMV_GetInstanceCached()
+	if not instanceMapID then DMV_HideBlips(); return end
 
 	local floorRects = DMV_FloorMapRects and DMV_FloorMapRects[instanceMapID]
 	local rect = floorRects and floorRects[DMV_CurrentFloor]
-	if not rect or not rect.locLeft then
-		for i = 1, 40 do if DMV_PartyBlips[i] then DMV_PartyBlips[i]:Hide() end end
-		return
-	end
+	if not rect or not rect.locLeft then DMV_HideBlips(); return end
 
 	local width  = rect.locLeft - rect.locRight
 	local height = rect.locTop  - rect.locBottom
-	if width == 0 or height == 0 then return end
+	if width == 0 or height == 0 then DMV_HideBlips(); return end
 
 	local canvas = GetMapCanvas()
 	local canvasW = canvas:GetWidth()
 	local canvasH = canvas:GetHeight()
+	-- Movement threshold in canvas units: constant on screen at any zoom.
+	local moveEps = BLIP_MOVE_EPS / (canvas:GetScale() or 1)
 
-	local units = {}
-	local numRaid = GetNumRaidMembers()
+	-- Collect the units to draw. The player's subgroup is taken from the
+	-- roster row whose unit is the player, so UnitInRaid's index base
+	-- does not matter.
+	local numUnits = 0
+	if DMV_RosterDirty then DMV_RefreshRosterCache() end
+	local numRaid = DMV_RosterNumRaid
 	if numRaid > 0 then
-		local playerSubgroup = nil
-		local playerIndex = UnitInRaid("player")
-		if playerIndex then
-			playerSubgroup = select(3, GetRaidRosterInfo(playerIndex + 1))
-		end
+		local playerIndex, playerSubgroup = DMV_RosterPlayerIndex, DMV_RosterPlayerSubgroup
 		for i = 1, numRaid do
-			local unit = "raid"..i
-			if not UnitIsUnit(unit, "player") then
-				local subgroup = select(3, GetRaidRosterInfo(i))
-				local isPartyMember = (subgroup == playerSubgroup)
+			if i ~= playerIndex then
+				local isPartyMember = (DMV_RaidSubgroups[i] == playerSubgroup)
 				if (isPartyMember and showParty) or (not isPartyMember and showRaid) then
-					units[#units + 1] = { unit = unit, sameParty = isPartyMember }
+					numUnits = numUnits + 1
+					DMV_BlipUnits[numUnits] = DMV_RAID_UNITS[i]
+					DMV_BlipSameParty[numUnits] = isPartyMember
 				end
 			end
 		end
-	else
-		if showParty then
-			local numParty = GetNumPartyMembers()
-			for i = 1, numParty do
-				units[#units + 1] = { unit = "party"..i, sameParty = true }
-			end
+	elseif showParty then
+		for i = 1, GetNumPartyMembers() do
+			numUnits = numUnits + 1
+			DMV_BlipUnits[numUnits] = DMV_PARTY_UNITS[i]
+			DMV_BlipSameParty[numUnits] = true
 		end
 	end
 
-	for i = #units + 1, 40 do
-		if DMV_PartyBlips[i] then DMV_PartyBlips[i]:Hide() end
-	end
+	DMV_HideBlips(numUnits + 1)
 
-	for i, entry in ipairs(units) do
+	-- Geometry for DMV_MovePartyBlips until the next full refresh.
+	DMV_BlipLocLeft, DMV_BlipLocTop, DMV_BlipW, DMV_BlipH = rect.locLeft, rect.locTop, width, height
+	DMV_BlipCanvasW, DMV_BlipCanvasH, DMV_BlipEps = canvasW, canvasH, moveEps
+	DMV_BlipMoveCount = numUnits
+
+	for i = 1, numUnits do
+		local unit = DMV_BlipUnits[i]
 		local blip = DMV_GetOrCreateBlip(i)
-		if not blip then break end
-		local posY, posX = UnitPosition(entry.unit)
-		if not posY or not posX then blip:Hide() else
-			local mapX = (rect.locLeft - posY) / width  * 100
-			local mapY = (rect.locTop  - posX) / height * 100
-			if mapX < 0 or mapX > 100 or mapY < 0 or mapY > 100 then
-				blip:Hide()
-			else
-				blip.unit = entry.unit
-				blip.tex:SetTexture(entry.sameParty and BLIP_TEX_PARTY or BLIP_TEX_RAID)
-				local _, class = UnitClass(entry.unit)
+		if not blip then DMV_BlipMoveCount = i - 1; break end
+		local name = UnitName(unit)
+		local posY, posX = UnitPosition(unit)
+		local remoteOnly = false
+		if not posY or not posX then
+			posY, posX = nil, nil
+			-- Out of client range: use the position the member's DMV broadcast,
+			-- unless the member has gone offline since.
+			if syncedPos and name and UnitIsConnected(unit) then
+				posY, posX = syncedPos(name, instanceMapID)
+				remoteOnly = posY ~= nil
+			end
+		end
+		local mapX, mapY
+		if posY and posX and (not shouldShow
+				or shouldShow(name, instanceMapID, DMV_CurrentFloor, DMV_ActualFloor, remoteOnly)) then
+			mapX = (rect.locLeft - posY) / width  * 100
+			mapY = (rect.locTop  - posX) / height * 100
+			if mapX < 0 or mapX > 100 or mapY < 0 or mapY > 100 then mapX = nil end
+		end
+		if not mapX then
+			blip.live = false
+			blip:Hide()
+		else
+			-- A blip slot can be reassigned to another member when the
+			-- roster changes, so unit, type and class are all compared;
+			-- texture and color are only touched when one of them differs.
+			local isParty = DMV_BlipSameParty[i] and true or false
+			if blip.isParty ~= isParty then
+				blip.tex:SetTexture(isParty and BLIP_TEX_PARTY or BLIP_TEX_RAID)
+				blip.isParty = isParty
+			end
+			local class = DMV_UnitClassCache[unit]
+			if not class then
+				local _, c = UnitClass(unit)
+				class = c or false
+				if c then DMV_UnitClassCache[unit] = c end
+			end
+			if blip.class ~= class then
 				local color = class and RAID_CLASS_COLORS[class]
 				if color then
 					blip.tex:SetVertexColor(color.r, color.g, color.b, 1)
 				else
 					blip.tex:SetVertexColor(1, 1, 1, 1)
 				end
-				blip:ClearAllPoints()
-				blip:SetPoint("CENTER", DMV_Container, "TOPLEFT",
-					(mapX / 100) * canvasW, -(mapY / 100) * canvasH)
-				blip:Show()
+				blip.class = class
 			end
+			blip.unit = unit
+			local nameChanged = blip.name ~= name
+			blip.name = name
+			local px, py = (mapX / 100) * canvasW, -(mapY / 100) * canvasH
+			if not blip.px or math.abs(px - blip.px) > moveEps or math.abs(py - blip.py) > moveEps then
+				blip:ClearAllPoints()
+				blip:SetPoint("CENTER", DMV_Container, "TOPLEFT", px, py)
+				blip.px, blip.py = px, py
+			end
+			blip.live = not remoteOnly
+			blip:Show()
+			-- Slot now shows another member: refresh the open tooltip.
+			if nameChanged and blip.hovered then DMV_ShowUnitTooltip(blip) end
 		end
 	end
 end
 
+
+-- The refresh ticker lives on its own frame. It used to sit on the player
+-- arrow, but the arrow is hidden while viewing another floor, and hidden
+-- frames never run OnUpdate, so member blips froze on non-player floors.
+local DMV_RefreshTicker = nil
 
 local function DMV_StartArrowUpdates()
 	DMV_CreatePlayerArrow()
 	if not DMV_PlayerArrow then return end
-	if DMV_PlayerArrow:GetScript("OnUpdate") then return end
-	DMV_PlayerArrow:SetScript("OnUpdate", function(self, elapsed)
-		if DMV_Visible and DMV_CurrentDungeon and not DMV_PreviewMode then
-			DMV_UpdatePlayerArrow()
-			DMV_UpdatePartyBlips()
-		end
-	end)
-	DMV_PlayerArrowTicker = true
+	if not DMV_RefreshTicker then
+		DMV_RefreshTicker = CreateFrame("Frame", "DMV_RefreshTicker")
+		DMV_RefreshTicker:SetScript("OnUpdate", function(self, elapsed)
+			-- Positional elapsed (ClassicAPI) or the legacy arg1 global.
+			elapsed = tonumber(elapsed) or tonumber(arg1) or 0
+			if DMV_Visible and DMV_CurrentDungeon and not DMV_PreviewMode then
+				DMV_UpdatePlayerArrow()
+				DMV_BlipElapsed = DMV_BlipElapsed + elapsed
+				if DMV_BlipElapsed >= BLIP_REFRESH then
+					DMV_BlipElapsed = 0
+					DMV_UpdatePartyBlips()
+				else
+					DMV_MovePartyBlips()
+				end
+			end
+		end)
+	end
+	DMV_BlipElapsed = BLIP_REFRESH	-- draw the blips on the first tick
+	DMV_RefreshTicker:Show()
+end
+
+-- Forget the hover state of the arrow and the blips, and close their
+-- tooltip. They are hidden together here when the map closes, from the
+-- map's own OnHide, and a frame hidden while its window is already closing
+-- gets no OnHide of its own, so the tooltip would otherwise stay open.
+local function DMV_ClearUnitHover()
+	local any = false
+	local arrow = DMV_PlayerArrow
+	if arrow and arrow.hovered then arrow.hovered = false; any = true end
+	for i = 1, table.getn(DMV_PartyBlips) do
+		local blip = DMV_PartyBlips[i]
+		if blip.hovered then blip.hovered = false; any = true end
+	end
+	if any then WorldMapTooltip:Hide() end
 end
 
 local function DMV_StopArrowUpdates()
-	if DMV_PlayerArrow then
-		DMV_PlayerArrow:SetScript("OnUpdate", nil)
-		DMV_PlayerArrow:Hide()
-	end
-	for i = 1, 40 do
-		if DMV_PartyBlips[i] then DMV_PartyBlips[i]:Hide() end
-	end
-	DMV_PlayerArrowTicker = nil
+	if DMV_RefreshTicker then DMV_RefreshTicker:Hide() end
+	DMV_HidePlayerArrow()
+	DMV_HideBlips()
+	DMV_ClearUnitHover()
 end
 
 -- Create the overlay frames
@@ -512,9 +940,7 @@ function DMV_CreateFrames()
 				mx, my = mx / csc, my / csc
 				local dx = mx - DMV_Container:GetLeft()
 				local dy = DMV_Container:GetTop() - my
-				local x = dx / (MAP_W * DMV_MapScale) * 100
-				local y = dy / (MAP_H * DMV_MapScale) * 100
-				print(string.format("|cff00ff00DMV calib|r: x=%.1f, y=%.1f", x, y))
+				print("|cff00ff00DMV calib|r: " .. DMV_CalibCoordsText(dx, dy))
 			end
 		end
 	end)
@@ -546,7 +972,7 @@ function DMV_CreateFrames()
 	ddHeader:SetText(FLOOR or L["Floor"])
 	dd.header = ddHeader
 
-	-- Up arrow button (goes to lower index = higher floor number, matching 3.3.5a)
+	-- Up arrow: previous entry in the floor list (as in 3.3.5a)
 	local upBtn = CreateFrame("Button", "DMV_LevelUpButton", WorldMapFrame)
 	upBtn:SetSize(16, 16)
 	upBtn:SetPoint("TOPLEFT", dd, "TOPRIGHT", -10, 8)
@@ -560,7 +986,7 @@ function DMV_CreateFrames()
 			if floors then
 				for i, f in ipairs(floors) do
 					if f == DMV_CurrentFloor and i > 1 then
-						DMV_LevelDropDown_SetFloor(floors[i - 1], i - 1)
+						DMV_LevelDropDown_SetFloor(floors[i - 1])
 						break
 					end
 				end
@@ -570,7 +996,7 @@ function DMV_CreateFrames()
 	upBtn:Hide()
 	DMV_LevelUpButton = upBtn
 
-	-- Down arrow button
+	-- Down arrow: next entry in the floor list
 	local downBtn = CreateFrame("Button", "DMV_LevelDownButton", WorldMapFrame)
 	downBtn:SetSize(16, 16)
 	downBtn:SetPoint("BOTTOMLEFT", dd, "BOTTOMRIGHT", -10, 2)
@@ -584,7 +1010,7 @@ function DMV_CreateFrames()
 			if floors then
 				for i, f in ipairs(floors) do
 					if f == DMV_CurrentFloor and i < #floors then
-						DMV_LevelDropDown_SetFloor(floors[i + 1], i + 1)
+						DMV_LevelDropDown_SetFloor(floors[i + 1])
 						break
 					end
 				end
@@ -658,37 +1084,51 @@ function DMV_CreateFrames()
 	playerFrame:Hide()
 	DMV_PlayerCoordsFrame = playerFrame
 
-	local coordUpdater = CreateFrame("Frame")
-	coordUpdater:SetScript("OnUpdate", function()
-		if DMV_CoordsDisabled then return end
-		if not DMV_CoordsFrame or not DMV_CoordsFrame:IsShown() then return end
-
+	-- Runs on the cursor coordinate frame, which is only shown while the
+	-- dungeon map is displayed with coordinates enabled. Text is only
+	-- rewritten when the rounded value changes.
+	-- The cursor is measured in DMV_Container's space, the same space the
+	-- arrow and blips are placed in, so both readouts agree at any
+	-- overlayScale (the container is scaled, the canvas is not).
+	local lastCX, lastCY, lastPX, lastPY = false, false, false, false
+	cursorFrame:SetScript("OnUpdate", function()
+		local c = DMV_Container
 		local df = GetMapCanvas()
-		if df then
+		if c and df then
 			local cx, cy = GetCursorPosition()
-			local scale  = df:GetEffectiveScale()
+			local scale  = c:GetEffectiveScale()
 			cx = cx / scale
 			cy = cy / scale
-			local left	 = df:GetLeft()
-			local top	 = df:GetTop()
+			local left	 = c:GetLeft()
+			local top	 = c:GetTop()
 			local width  = df:GetWidth()
 			local height = df:GetHeight()
 			if left and top and width > 0 and height > 0 then
 				local nx = (cx - left) / width
 				local ny = (top - cy)  / height
 				if nx >= 0 and nx <= 1 and ny >= 0 and ny <= 1 then
-					DMV_CoordsFrame.text:SetText(string.format("Cursor: %.1f / %.1f", nx * 100, ny * 100))
-				else
-					DMV_CoordsFrame.text:SetText("Cursor: N/A")
+					local kx, ky = math.floor(nx * 1000 + 0.5), math.floor(ny * 1000 + 0.5)
+					if kx ~= lastCX or ky ~= lastCY then
+						lastCX, lastCY = kx, ky
+						cursorText:SetText(string.format("%s: %.1f / %.1f", L["Cursor"], nx * 100, ny * 100))
+					end
+				elseif lastCX ~= nil then
+					lastCX, lastCY = nil, nil
+					cursorText:SetText(L["Cursor"] .. ": " .. NOT_APPLICABLE)
 				end
 			end
 		end
 
 		if DMV_LastPlayerMapPos then
-			DMV_PlayerCoordsFrame.text:SetText(string.format("Player: %.1f / %.1f",
-				DMV_LastPlayerMapPos.x, DMV_LastPlayerMapPos.y))
-		else
-			DMV_PlayerCoordsFrame.text:SetText("Player: N/A")
+			local x, y = DMV_LastPlayerMapPos.x, DMV_LastPlayerMapPos.y
+			local kx, ky = math.floor(x * 10 + 0.5), math.floor(y * 10 + 0.5)
+			if kx ~= lastPX or ky ~= lastPY then
+				lastPX, lastPY = kx, ky
+				playerText:SetText(string.format("%s: %.1f / %.1f", PLAYER, x, y))
+			end
+		elseif lastPX ~= nil then
+			lastPX, lastPY = nil, nil
+			playerText:SetText(PLAYER .. ": " .. NOT_APPLICABLE)
 		end
 	end)
 end
@@ -704,20 +1144,24 @@ function DMV_SetTextures(dungeonName, floor)
 		DMV_Textures[i]:SetTexture(path)
 	end
 
+	if dungeonName ~= DMV_CurrentDungeon or floor ~= DMV_CurrentFloor then
+		-- The blips' geometry belongs to the old map: hold them still and
+		-- run a full refresh on the next frame.
+		DMV_BlipMoveCount = 0
+		DMV_BlipElapsed = BLIP_REFRESH
+	end
 	DMV_CurrentDungeon = dungeonName
 	DMV_CurrentFloor = floor
 end
 
--- Floor button display
--- Apply a floor selection from the dropdown or arrow buttons.
-function DMV_LevelDropDown_SetFloor(floorNum, dropdownIndex)
+-- Apply a floor selection from the Areas list or the arrow buttons.
+function DMV_LevelDropDown_SetFloor(floorNum)
 	if not DMV_CurrentDungeon then return end
 	DMV_SetTextures(DMV_CurrentDungeon, floorNum)
 	DMV_UpdateFloorButtons()
 	DMV_UpdatePlayerArrow()
 	DMV_UpdatePartyBlips()
-	if DMV_HideBossPins then DMV_HideBossPins() end
-	if DMV_ShowBossPins then DMV_ShowBossPins() end
+	DMV_ShowBossPins()
 end
 
 -- Populate and show/hide the floor dropdown, mirroring WorldMapLevelDropDown_Update.
@@ -772,19 +1216,6 @@ local function DMV_UpdateFloorButtonsLive()
 	if DMV_RefreshAreaList then DMV_RefreshAreaList() end
 end
 
--- Called when the player picks an entry from the dropdown.
-function DMV_LevelDropDown_OnClick(self)
-	local floors = DMV_CurrentDungeon and DMV_DungeonFloors[DMV_CurrentDungeon]
-	if not floors then return end
-	local button = self or this
-	if not button then return end
-	local idx = button:GetID()
-	local floorNum = floors[idx]
-	if floorNum then
-		DMV_LevelDropDown_SetFloor(floorNum, idx)
-	end
-end
-
 -- Areas: dedicated dropdown list
 -- Use the same private-list layout as Dungeon Markers rather than Blizzard's
 -- shared DropDownList button pool, whose default font and row sizing differ.
@@ -834,7 +1265,7 @@ function DMV_RefreshAreaList()
 					if IsShiftKeyDown() and not DMV_PreviewMode then
 						-- Force the current floor to the selected one, correcting
 						-- any mismatch caused by a crash that prevented a proper save.
-						local _, _, _, _, _, _, _, instanceMapID = GetInstanceInfo()
+						local _, instanceMapID = DMV_GetInstanceCached()
 						if instanceMapID then
 							DMV_ActualFloor = floorNum
 							DMV_LastKnownFloor[instanceMapID] = floorNum
@@ -847,7 +1278,7 @@ function DMV_RefreshAreaList()
 							DMV_ApplyRealFloorChange(floorNum)
 						end
 					else
-						DMV_LevelDropDown_SetFloor(floorNum, idx)
+						DMV_LevelDropDown_SetFloor(floorNum)
 						DMV_UpdateFloorButtonsLive()
 					end
 					PlaySound("igMainMenuOptionCheckBoxOn")
@@ -968,10 +1399,7 @@ local function DMV_MarkerRow_OnClick(self)
 	elseif item.kind == "faction" then
 		DMV_Settings.bossFaction = item.value
 	end
-	if DMV_Visible then
-		DMV_HideBossPins()
-		DMV_ShowBossPins()
-	end
+	if DMV_Visible then DMV_ShowBossPins() end
 	DMV_RefreshMarkerList()
 end
 
@@ -1071,11 +1499,6 @@ ToggleDropDownMenu = function(a1, a2, a3, a4, a5, a6, a7, a8, a9)
 	return _DMV_origToggleDropDownMenu(a1, a2, a3, a4, a5, a6, a7, a8, a9)
 end
 
--- Kept for compatibility with existing callers.
-function DMV_UpdateBossPinDropDown()
-	DMV_RefreshMarkerList()
-end
-
 
 -- Atlas integration: open Atlas to the map page for a dungeon.
 -- atlasMapKey must match a key in AtlasMaps (e.g. "ShadowfangKeep", "SMArmory").
@@ -1108,14 +1531,41 @@ function DMV_OpenAtlasBoss(atlasMapKey)
 	AtlasOptions.AtlasType = foundType
 	AtlasOptions.AtlasZone = foundZone
 	Atlas_Refresh()
-	AtlasFrame:SetFrameStrata("FULLSCREEN_DIALOG")
+	-- Raise Atlas above the world map, and put its own strata back when it
+	-- closes so later non-DMV opens are unaffected. The hook is installed
+	-- here rather than on Atlas's ADDON_LOADED, which normally fires before
+	-- DMV has loaded (Atlas is not a dependency).
+	if not AtlasFrame.DMV_StrataHooked then
+		AtlasFrame.DMV_StrataHooked = true
+		AtlasFrame:HookScript("OnHide", function()
+			AtlasFrame.DMV_OnTop = nil
+			if AtlasFrame.DMV_SavedStrata then
+				AtlasFrame:SetFrameStrata(AtlasFrame.DMV_SavedStrata)
+				AtlasFrame.DMV_SavedStrata = nil
+			end
+		end)
+	end
+	-- The strata is only changed when it differs: on the 1.12 client
+	-- SetFrameStrata also drops the frame to its parent's level + 1, which
+	-- would put an Atlas window that is already open (a second marker click)
+	-- under DMV's marker frames.
+	if AtlasFrame:GetFrameStrata() ~= "FULLSCREEN_DIALOG" then
+		if not AtlasFrame.DMV_SavedStrata then
+			AtlasFrame.DMV_SavedStrata = AtlasFrame:GetFrameStrata()
+		end
+		AtlasFrame:SetFrameStrata("FULLSCREEN_DIALOG")
+	end
 	AtlasFrame:Show()
+	AtlasFrame.DMV_OnTop = true
+	DMV_RaiseAtlas()
 	return true
 end
 
 -- AtlasLoot integration: open the loot page for a specific boss.
 -- The module may load asynchronously, so retry the sub-category/boss
 -- selection until the module data is available (bounded).
+local DMV_AtlasLootDelayFrame = nil
+
 function DMV_OpenAtlasLootBoss(instanceKey, bossIndex)
 	-- AtlasLootBossButtons[instanceKey][bossIndex] > dataID string
 	-- AtlasLoot_ShowBossLoot(dataID, bossDisplayText, pFrame)
@@ -1142,10 +1592,15 @@ function DMV_OpenAtlasLootBoss(instanceKey, bossIndex)
 	local bossText = (AtlasLoot_TableNames and AtlasLoot_TableNames[dataID] and AtlasLoot_TableNames[dataID][1]) or dataID
 	DMV_OpenAtlasBoss(instanceKey)
 	-- Delay slightly so Atlas finishes its refresh before the loot panel opens.
-	local delayFrame = CreateFrame("Frame")
+	-- One frame is reused for every click (frames are never freed).
+	local delayFrame = DMV_AtlasLootDelayFrame
+	if not delayFrame then
+		delayFrame = CreateFrame("Frame")
+		DMV_AtlasLootDelayFrame = delayFrame
+	end
 	delayFrame.timer = 0
 	delayFrame:SetScript("OnUpdate", function(self, elapsed)
-		-- ClassicAPI may expose the OnUpdate delta through legacy arg1.
+		-- Positional elapsed (ClassicAPI) or the legacy arg1 global.
 		elapsed = tonumber(elapsed) or tonumber(arg1) or 0
 		delayFrame.timer = delayFrame.timer + elapsed
 		if delayFrame.timer >= 0.1 then
@@ -1159,37 +1614,124 @@ local DMV_BOSS_PIN_SIZE		   = 32
 local DMV_BOSS_PIN_SIZE_ALT    = 16
 local DMV_BOSS_HOVER_MULT	   = 1.15
 local DMV_BOSS_HOVER_ALPHA	   = 0.5
-local DMV_BOSS_PIN_TEXTURE		= "Interface\\Addons\\DungeonMapsVanilla\\Assets\\boss.tga"
-local DMV_BOSS_PIN_TEXTURE_ALT	  = "Interface\\Addons\\DungeonMapsVanilla\\Assets\\quest.tga"
-local DMV_BOSS_PIN_TEXTURE_LOOT   = "Interface\\Addons\\DungeonMapsVanilla\\Assets\\loot.tga"
-local DMV_BOSS_PIN_TEXTURE_OBJECT = "Interface\\Addons\\DungeonMapsVanilla\\Assets\\object.tga"
+local DMV_BOSS_PIN_TEXTURE		= "Interface\\AddOns\\DungeonMapsVanilla\\Assets\\boss.tga"
+local DMV_BOSS_PIN_TEXTURE_ALT	  = "Interface\\AddOns\\DungeonMapsVanilla\\Assets\\quest.tga"
+local DMV_BOSS_PIN_TEXTURE_LOOT   = "Interface\\AddOns\\DungeonMapsVanilla\\Assets\\loot.tga"
+local DMV_BOSS_PIN_TEXTURE_OBJECT = "Interface\\AddOns\\DungeonMapsVanilla\\Assets\\object.tga"
+
+-- The marker whose tooltip is open (nil when none).
+local DMV_HoveredPin = nil
+
+local function DMV_PinBaseSize(pin)
+	return (pin.altTexture or pin.lootTexture or pin.objectTexture) and DMV_BOSS_PIN_SIZE_ALT or DMV_BOSS_PIN_SIZE
+end
+
+-- Size a marker for its type and hover state; only resized on change.
+local function DMV_ApplyPinSize(pin)
+	local size = DMV_PinBaseSize(pin)
+	if pin.hovered then size = size * DMV_BOSS_HOVER_MULT end
+	if pin.size ~= size then
+		pin:SetWidth(size)
+		pin:SetHeight(size)
+		pin.size = size
+	end
+end
+
+-- (Re)build the open marker tooltip from the pin's current fields.
+local function DMV_ShowPinTooltip(pin)
+	WorldMapTooltip:SetOwner(pin, "ANCHOR_RIGHT")
+	WorldMapTooltip:AddLine(pin.bossName, 1, 0.82, 0)
+	if pin.comment then
+		local filtered = DMV_FilterCommentByFaction(pin.comment)
+		if filtered then
+			local resolved = DMV_ResolveCommentItems(filtered)
+			local commentText = "|cff999999" .. string.gsub(resolved, "|r", "|r|cff999999")
+			WorldMapTooltip:AddLine(commentText)
+		end
+	end
+	if DMV_CalibMode then
+		WorldMapTooltip:AddLine("AtlasLoot #" .. tostring(pin.atlasBossIndex), 0.6, 0.8, 1)
+		if pin.removed then
+			WorldMapTooltip:AddLine(L["Marker removed"], 1, 0.4, 0.4)
+		else
+			WorldMapTooltip:AddLine(L["Marker move"], 0.7, 0.7, 0.7)
+			WorldMapTooltip:AddLine(L["Marker reset"], 0.7, 0.7, 0.7)
+			WorldMapTooltip:AddLine(L["Marker remove"], 0.7, 0.7, 0.7)
+		end
+	end
+	WorldMapTooltip:Show()
+end
+
+-- Rebuild the open marker tooltip, e.g. after a name in it was resolved.
+local function DMV_RefreshPinTooltip()
+	local pin = DMV_HoveredPin
+	if pin and pin.hovered and pin:IsVisible() then DMV_ShowPinTooltip(pin) end
+end
+
+-- End a calibration drag without saving anything.
+local function DMV_CancelPinDrag(pin)
+	if pin.isDragging then
+		pin.isDragging = false
+		pin:SetScript("OnUpdate", nil)
+		pin.px = nil	-- the drag moved it: re-anchor on the next refresh
+	end
+end
+
+-- Hidden mid-drag (map closed, floor changed): drop the drag, otherwise
+-- the pin would be saved wherever the cursor is when it shows again.
+-- Hover state is dropped too, so a reused pin never keeps the hover size
+-- or its glow. Runs from the pin's OnHide, and for every pin when the map
+-- closes, so it does not depend on the client sending OnHide to the
+-- frames inside a closing window.
+local function DMV_ResetPinInteraction(pin)
+	if pin.highlight then pin.highlight:Hide() end
+	DMV_CancelPinDrag(pin)
+	if pin.hovered then
+		pin.hovered = false
+		DMV_ApplyPinSize(pin)
+		if DMV_HoveredPin == pin then
+			DMV_HoveredPin = nil
+			WorldMapTooltip:Hide()
+		end
+	end
+end
+
+function DMV_ResetPinsOnMapHide()
+	for i = 1, table.getn(DMV_BossPins) do DMV_ResetPinInteraction(DMV_BossPins[i]) end
+end
 
 -- Boss pins: markers that open AtlasLoot on click
 local function DMV_CreateBossPin(pinIndex)
+	-- Takes the mouse below the member blips (+18) and the player arrow
+	-- (+20). Its images are drawn by DMV_OverlayDraw: the icon in the bottom
+	-- layer, the hover glow above every marker icon.
 	local pin = CreateFrame("Frame", "DMV_BossPin" .. pinIndex, DMV_Container)
 	pin:SetSize(DMV_BOSS_PIN_SIZE, DMV_BOSS_PIN_SIZE)
-	pin:SetFrameLevel(DMV_Container:GetFrameLevel() + 15)
 	pin:SetFrameStrata("FULLSCREEN_DIALOG")
+	pin:SetFrameLevel(DMV_Container:GetFrameLevel() + PIN_LEVEL)
 	pin:EnableMouse(true)
+	pin.size = DMV_BOSS_PIN_SIZE
 
-	local icon = pin:CreateTexture(nil, "OVERLAY")
-	icon:SetAllPoints(pin)
+	local icon = DMV_CreateOverlayRegion(pin, "BACKGROUND")
 	icon:SetTexture(DMV_BOSS_PIN_TEXTURE)
 	pin.icon = icon
 
-	local highlight = pin:CreateTexture(nil, "HIGHLIGHT")
-	highlight:SetAllPoints(pin)
+	-- Hover glow: shown only while the marker is hovered.
+	local highlight = DMV_CreateOverlayRegion(pin, "BORDER")
 	highlight:SetTexture(DMV_BOSS_PIN_TEXTURE)
 	highlight:SetBlendMode("ADD")
-	highlight:SetAlpha(0)
+	highlight:SetAlpha(DMV_BOSS_HOVER_ALPHA)
+	highlight:Hide()
 	pin.highlight = highlight
+	pin.texPath = DMV_BOSS_PIN_TEXTURE
 
-	-- AtlasLoot boss number, shown in calib mode
-	local label = pin:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	-- AtlasLoot boss number, shown in calib mode (pin.labelOn)
+	local label = DMV_CreateOverlayRegion(pin, "OVERLAY", true)
 	label:SetPoint("LEFT", pin, "RIGHT", 1, 0)
 	label:SetTextColor(1, 0.9, 0.2)
 	label:Hide()
 	pin.label = label
+	pin.labelOn = false
 
 	pin.bossName = ""
 	pin.comment = nil
@@ -1198,44 +1740,35 @@ local function DMV_CreateBossPin(pinIndex)
 	pin.atlasEntries = nil
 	pin.instanceMapID = nil
 	pin.bossOrdinal = nil
+	pin.isDMVPin = true
 
 	pin.removed = false
 
 	pin:SetScript("OnEnter", function()
-		local baseSize = (pin.altTexture or pin.lootTexture or pin.objectTexture) and DMV_BOSS_PIN_SIZE_ALT or DMV_BOSS_PIN_SIZE
-		local newSize = baseSize * DMV_BOSS_HOVER_MULT
-		pin:SetWidth(newSize)
-		pin:SetHeight(newSize)
-		pin.highlight:SetAlpha(DMV_BOSS_HOVER_ALPHA)
-		WorldMapTooltip:SetOwner(pin, "ANCHOR_RIGHT")
-		WorldMapTooltip:AddLine(pin.bossName, 1, 0.82, 0)
-		if pin.comment then
-			local filtered = DMV_FilterCommentByFaction(pin.comment)
-			if filtered then
-				local resolved = DMV_ResolveCommentItems(filtered)
-				local commentText = "|cff999999" .. string.gsub(resolved, "|r", "|r|cff999999")
-				WorldMapTooltip:AddLine(commentText)
-			end
-		end
-		if DMV_CalibMode then
-			WorldMapTooltip:AddLine("AtlasLoot #" .. tostring(pin.atlasBossIndex), 0.6, 0.8, 1)
-			if pin.removed then
-				WorldMapTooltip:AddLine(L["Marker removed"], 1, 0.4, 0.4)
-			else
-				WorldMapTooltip:AddLine(L["Marker move"], 0.7, 0.7, 0.7)
-				WorldMapTooltip:AddLine(L["Marker reset"], 0.7, 0.7, 0.7)
-				WorldMapTooltip:AddLine(L["Marker remove"], 0.7, 0.7, 0.7)
-			end
-		end
-		WorldMapTooltip:Show()
+		pin.hovered = true
+		DMV_HoveredPin = pin
+		DMV_ApplyPinSize(pin)
+		highlight:Show()
+		DMV_ShowPinTooltip(pin)
 	end)
 	pin:SetScript("OnLeave", function()
-		local baseSize = (pin.altTexture or pin.lootTexture or pin.objectTexture) and DMV_BOSS_PIN_SIZE_ALT or DMV_BOSS_PIN_SIZE
-		pin:SetWidth(baseSize)
-		pin:SetHeight(baseSize)
-		pin.highlight:SetAlpha(0)
+		pin.hovered = false
+		if DMV_HoveredPin == pin then DMV_HoveredPin = nil end
+		DMV_ApplyPinSize(pin)
+		highlight:Hide()
 		WorldMapTooltip:Hide()
 	end)
+	DMV_BindImages(pin,
+		function()
+			icon:Show()
+			if pin.labelOn then label:Show() end
+		end,
+		function()
+			icon:Hide()
+			label:Hide()
+			highlight:Hide()
+		end)
+	pin:SetScript("OnHide", function() DMV_ResetPinInteraction(pin) end)
 
 	pin:SetScript("OnMouseDown", function(self, button)
 		button = button or arg1
@@ -1254,7 +1787,6 @@ local function DMV_CreateBossPin(pinIndex)
 				e.removed = not e.removed
 				print(string.format("|cff00ff00DMV calib|r: %s %s", pin.bossName,
 					e.removed and "|cffff4040removed|r" or "|cff40ff40restored|r"))
-				DMV_HideBossPins()
 				DMV_ShowBossPins()
 				return
 			end
@@ -1264,7 +1796,6 @@ local function DMV_CreateBossPin(pinIndex)
 				if inst then inst[pin.bossOrdinal] = nil end
 				print(string.format("|cff00ff00DMV calib|r: %s - position reset (place it on the correct floor)",
 					pin.bossName))
-				DMV_HideBossPins()
 				DMV_ShowBossPins()
 				return
 			end
@@ -1282,8 +1813,10 @@ local function DMV_CreateBossPin(pinIndex)
 				local dy = math.max(0, math.min(maxY, DMV_Container:GetTop() - my))
 				s:ClearAllPoints()
 				s:SetPoint("CENTER", DMV_Container, "TOPLEFT", dx, -dy)
+				s.px = nil
 				s.calibX = dx / maxX * 100
 				s.calibY = dy / maxY * 100
+				s.calibDX, s.calibDY = dx, dy
 				if not IsMouseButtonDown("LeftButton") then
 					s.isDragging = false
 					s:SetScript("OnUpdate", nil)
@@ -1294,8 +1827,10 @@ local function DMV_CreateBossPin(pinIndex)
 						local inst = DMV_GlobalSettings.bossPinOverrides[s.instanceMapID]
 						if not inst then inst = {}; DMV_GlobalSettings.bossPinOverrides[s.instanceMapID] = inst end
 						inst[s.bossOrdinal] = { x, y, DMV_CurrentFloor }
-						print(string.format("|cff00ff00DMV calib|r: %s -> x=%.1f, y=%.1f, floor %d (saved)",
-							s.bossName, x, y, DMV_CurrentFloor))
+						-- The saved override is in marker units; the map
+						-- percentages are printed beside it, as for map clicks.
+						print(string.format("|cff00ff00DMV calib|r: %s -> %s, floor %d (saved)",
+							s.bossName, DMV_CalibCoordsText(s.calibDX, s.calibDY), DMV_CurrentFloor))
 					end
 				end
 			end)
@@ -1319,19 +1854,24 @@ local function DMV_CreateBossPin(pinIndex)
 	end)
 
 	DMV_BossPins[pinIndex] = pin
+	DMV_ApplyOverlayLevels()
 	return pin
 end
 
-function DMV_HideBossPins()
-	for _, pin in ipairs(DMV_BossPins) do
-		pin:Hide()
+-- Hide markers from index `fromIndex` (default: all of them).
+local function DMV_HidePinsFrom(fromIndex)
+	for i = fromIndex or 1, table.getn(DMV_BossPins) do
+		DMV_BossPins[i]:Hide()
 	end
 end
 
--- Reverse map: dungeon texture folder name > instanceMapID (built lazily
--- from DMV_DungeonByMapID). Used in preview mode where GetInstanceInfo()
--- returns the player's real location, not the previewed dungeon.
-local DMV_DungeonNameToId = nil
+function DMV_HideBossPins()
+	DMV_HidePinsFrom(1)
+end
+
+-- Look up the instanceMapID for a dungeon texture folder name in
+-- DMV_DungeonByMapID (folder names are unique). Used in preview mode, where
+-- GetInstanceInfo() returns the player's real location, not the previewed one.
 local function DMV_GetInstanceIdForDungeon(name)
 	if not name then return nil end
 	if DMV_DungeonByMapID then
@@ -1384,13 +1924,13 @@ DMV_ResolveIDName = function(idStr)
 		end
 		C_QuestLog.RequestLoadQuestByID(id)
 	elseif prefix == "i" then
-		local iname   = C_Item.GetItemNameByID(id)
-		local quality = C_Item.GetItemQualityByID(id)
+		-- On a cache miss GetItemNameByID itself starts the load, and
+		-- GET_ITEM_INFO_RECEIVED fires when the item arrives.
+		local iname = C_Item.GetItemNameByID(id)
 		if iname then
-			DMV_NameCache[idStr] = { iname, quality or 1 }
+			DMV_NameCache[idStr] = { iname, C_Item.GetItemQualityByID(id) or 1 }
 			return DMV_NameCache[idStr]
 		end
-		C_Item.RequestLoadItemDataByID(id)
 	else
 		-- Unknown prefix, use the raw string.
 		DMV_NameCache[idStr] = idStr
@@ -1464,8 +2004,11 @@ end
 -- Replace n/o/q/i <id> tokens in a comment string with resolved names.
 -- Items are formatted as colored [Name]; others as plain name text.
 -- Tokens still pending are left as is and will resolve on next hover.
+-- A token directly after "|" is a "|n" line break followed by a number
+-- (e.g. "|n5 i19975"), not an ID, and is left untouched.
 DMV_ResolveCommentItems = function(comment)
-	return string.gsub(comment, "([noqi])(%d+)", function(prefix, digits)
+	return string.gsub(comment, "(|?)([noqi])(%d+)", function(pipe, prefix, digits)
+		if pipe ~= "" then return pipe .. prefix .. digits end
 		local idStr = prefix .. digits
 		local entry = DMV_NameCache[idStr]
 		if type(entry) == "table" then
@@ -1497,34 +2040,132 @@ local function DMV_PinMatchesFloor(pinFloor, currentFloor)
 	return pinFloor == currentFloor
 end
 
-function DMV_ShowBossPins()
-	if not DMV_Settings then return end
-	if not DMV_Settings.bossPins and not DMV_Settings.bossPinAlt
-	   and not DMV_Settings.bossPinLoot and not DMV_Settings.bossPinObject then return end
-	if not DMV_Container then return end
-	if not DMV_Markers then return end
+-- Translate L["..."] tokens embedded in marker data strings.
+local function DMV_TranslateTokens(str)
+	if not str then return nil end
+	return (string.gsub(str, 'L%["([^"]+)"%]', function(k) return L[k] or k end))
+end
 
-	DMV_HideBossPins()
+-- Marker data parsed once per instance: translations applied and the
+-- type/faction prefixes and ID token split off. Only the ID name lookup
+-- (which resolves asynchronously) and the settings filters run per refresh.
+local DMV_ParsedMarkers = {}
+
+local function DMV_GetParsedMarkers(instanceMapID)
+	local parsed = DMV_ParsedMarkers[instanceMapID]
+	if parsed then return parsed end
+	local data = DMV_Markers and DMV_Markers[instanceMapID]
+	if not data then return nil end
+	parsed = {}
+	for ordinal, boss in ipairs(data) do
+		local displayName = DMV_TranslateTokens(boss[1]) or ""
+		local useAltTexture, useLootTexture, useObjectTexture = false, false, false
+		local pinFaction = nil  -- nil = no faction, "Alliance" or "Horde"
+		local excludeIfAtlas = false
+		-- Parse type/faction prefixes in any order. "!" selects quest pins;
+		-- "L "/"O " select loot/object pins, with the letter also
+		-- accepted directly before an encoded ID. Requiring a delimiter or
+		-- ID token prevents ordinary names (e.g. "Lord...") being misread.
+		local prefixDone = false
+		while not prefixDone do
+			local ch = string.sub(displayName, 1, 1)
+			if ch == "!" then
+				useAltTexture, useLootTexture, useObjectTexture = true, false, false
+				displayName = string.sub(displayName, 2)
+			elseif ch == "L" and (string.sub(displayName, 2, 2) == " "
+				or string.match(displayName, "^L[noqi]%d+")) then
+				useAltTexture, useLootTexture, useObjectTexture = false, true, false
+				if string.sub(displayName, 2, 2) == " " then
+					displayName = string.sub(displayName, 3)
+				else
+					displayName = string.sub(displayName, 2)
+				end
+			elseif ch == "O" and (string.sub(displayName, 2, 2) == " "
+				or string.match(displayName, "^O[noqi]%d+")) then
+				useAltTexture, useLootTexture, useObjectTexture = false, false, true
+				if string.sub(displayName, 2, 2) == " " then
+					displayName = string.sub(displayName, 3)
+				else
+					displayName = string.sub(displayName, 2)
+				end
+			elseif ch == "A" and string.sub(displayName, 2, 2) == " " then
+				pinFaction = "Alliance"
+				displayName = string.sub(displayName, 3)
+			elseif ch == "H" and string.sub(displayName, 2, 2) == " " then
+				pinFaction = "Horde"
+				displayName = string.sub(displayName, 3)
+			elseif ch == "E" and string.sub(displayName, 2, 2) == " " then
+				excludeIfAtlas = true
+				displayName = string.sub(displayName, 3)
+			else
+				prefixDone = true
+			end
+		end
+		-- ID-based names: n<id> = NPC, o<id> = object, q<id> = quest,
+		-- i<id> = item. Anything after the ID (e.g. " / n3865") is kept.
+		local pfx, digits, remainder = string.match(displayName, "^([noqi])(%d+)(.*)")
+		parsed[ordinal] = {
+			name = displayName,
+			idPrefix = pfx,
+			idStr = pfx and (pfx .. digits) or nil,
+			remainder = remainder,
+			x = boss[2], y = boss[3], floor = boss[4],
+			atlasKey = boss[5], atlasBossIndex = boss[6],
+			comment = DMV_TranslateTokens(boss[7]),
+			alt = useAltTexture, loot = useLootTexture, object = useObjectTexture,
+			faction = pinFaction, excludeIfAtlas = excludeIfAtlas,
+		}
+	end
+	DMV_ParsedMarkers[instanceMapID] = parsed
+	return parsed
+end
+
+-- Current display name of a parsed marker (ID names resolve asynchronously).
+local function DMV_MarkerDisplayName(m)
+	if not m.idStr then return m.name end
+	local resolved = DMV_ResolveIDName(m.idStr)
+	local base
+	if type(resolved) == "table" then
+		if m.idPrefix == "q" then
+			base = DMV_FormatQuestText(resolved)
+		else
+			base = DMV_FormatItemText(resolved)
+		end
+	else
+		base = resolved or ("(" .. m.idStr .. ")")
+	end
+	-- Resolve any further IDs in the remainder.
+	return base .. (DMV_ResolveCommentItems(m.remainder))
+end
+
+-- Draw the markers for the displayed floor. Markers are updated in place
+-- and only surplus ones are hidden, so a refresh never hides the marker
+-- under the cursor (which would flicker its tooltip).
+function DMV_ShowBossPins()
+	local st = DMV_Settings
+	if not DMV_Container then return end
+	if not st or not DMV_Markers or not (st.bossPins or st.bossPinAlt or st.bossPinLoot or st.bossPinObject) then
+		DMV_HidePinsFrom(1); return
+	end
 
 	local instanceMapID
 	if DMV_PreviewMode and DMV_CurrentDungeon then
 		instanceMapID = DMV_GetInstanceIdForDungeon(DMV_CurrentDungeon)
 	else
-		local _, _, _, _, _, _, _, iid = GetInstanceInfo()
+		local _, iid = DMV_GetInstanceCached()
 		instanceMapID = iid
 	end
-	if not instanceMapID then return end
-	local data = DMV_Markers[instanceMapID]
-	if not data then return end
+	local data = instanceMapID and DMV_GetParsedMarkers(instanceMapID)
+	if not data then DMV_HidePinsFrom(1); return end
 
-	local overrides = DMV_GlobalSettings.bossPinOverrides and DMV_GlobalSettings.bossPinOverrides[instanceMapID]
+	local overrides = DMV_GlobalSettings and DMV_GlobalSettings.bossPinOverrides
+		and DMV_GlobalSettings.bossPinOverrides[instanceMapID]
+	local factionFilter = st.bossFaction or "all"
+	local atlasLoaded = Atlas_Refresh ~= nil
 
 	local pinIndex = 0
-	for ordinal, boss in ipairs(data) do
-		local name, x, y, floor, atlasKey, atlasBossIndex, comment =
-			boss[1], boss[2], boss[3], boss[4], boss[5], boss[6], boss[7]
-		if name then name = name:gsub('L%["([^"]+)"%]', function(k) return L and L[k] or k end) end
-		if comment then comment = comment:gsub('L%["([^"]+)"%]', function(k) return L and L[k] or k end) end
+	for ordinal, m in ipairs(data) do
+		local x, y, floor = m.x, m.y, m.floor
 		local ov = overrides and overrides[ordinal]
 		local removed = false
 		local placed = false
@@ -1541,130 +2182,56 @@ function DMV_ShowBossPins()
 		else
 			floorOK = DMV_PinMatchesFloor(floor, DMV_CurrentFloor)
 		end
+		local factionOK = (factionFilter == "all") or (m.faction == nil) or (factionFilter == m.faction)
+		local typeOK
+		if m.alt then typeOK = st.bossPinAlt
+		elseif m.loot then typeOK = st.bossPinLoot
+		elseif m.object then typeOK = st.bossPinObject
+		else typeOK = st.bossPins end
+
 		if (not removed or DMV_CalibMode)
 		   and x and y and floorOK
-		   and x >= 0 and y >= 0 and x <= 100 and y <= 100 then
+		   and x >= 0 and y >= 0 and x <= 100 and y <= 100
+		   and typeOK and factionOK
+		   and not (m.excludeIfAtlas and not atlasLoaded) then
 			local px = (x / 100) * MAP_W * DMV_MapScale
 			local py = -(y / 100) * MAP_H * DMV_MapScale
-			local displayName = name or ""
-			local useAltTexture = false
-			local useLootTexture = false
-			local useObjectTexture = false
-			local pinFaction = nil  -- nil = no faction, "A" = Alliance, "H" = Horde
-			local excludeIfAtlas = false
-			-- Parse type/faction prefixes in any order. "!" selects quest pins;
-			-- "L "/"O " select loot/object pins, with the letter also
-			-- accepted directly before an encoded ID. Requiring a delimiter or
-			-- ID token prevents ordinary names (e.g. "Lord...") being misread.
-			local prefixDone = false
-			while not prefixDone do
-				local ch = string.sub(displayName, 1, 1)
-				if ch == "!" then
-					useAltTexture = true
-					useLootTexture = false
-					useObjectTexture = false
-					displayName = string.sub(displayName, 2)
-				elseif ch == "L" and (string.sub(displayName, 2, 2) == " "
-					or string.match(displayName, "^L[noqi]%d+")) then
-					useAltTexture = false
-					useLootTexture = true
-					useObjectTexture = false
-					if string.sub(displayName, 2, 2) == " " then
-						displayName = string.sub(displayName, 3)
-					else
-						displayName = string.sub(displayName, 2)
-					end
-				elseif ch == "O" and (string.sub(displayName, 2, 2) == " "
-					or string.match(displayName, "^O[noqi]%d+")) then
-					useAltTexture = false
-					useLootTexture = false
-					useObjectTexture = true
-					if string.sub(displayName, 2, 2) == " " then
-						displayName = string.sub(displayName, 3)
-					else
-						displayName = string.sub(displayName, 2)
-					end
-				elseif ch == "A" and string.sub(displayName, 2, 2) == " " then
-					pinFaction = "Alliance"
-					displayName = string.sub(displayName, 3)
-				elseif ch == "H" and string.sub(displayName, 2, 2) == " " then
-					pinFaction = "Horde"
-					displayName = string.sub(displayName, 3)
-				elseif ch == "E" and string.sub(displayName, 2, 2) == " " then
-					excludeIfAtlas = true
-					displayName = string.sub(displayName, 3)
-				else
-					prefixDone = true
-				end
-			end
-			-- Resolve ID-based names: n<id> = NPC, o<id> = object, q<id> = quest.
-			-- Anything after the ID (e.g. " / n3865") is kept and appended.
-			local pfx, digits, remainder = string.match(displayName, "^([noqi])(%d+)(.*)")
-			if pfx and digits then
-				local idStr   = pfx .. digits
-				local resolved = DMV_ResolveIDName(idStr)
-				local base
-				if type(resolved) == "table" then
-					if pfx == "q" then
-						base = DMV_FormatQuestText(resolved)
-					else
-						base = DMV_FormatItemText(resolved)
-					end
-				else
-					base = resolved or ("(" .. idStr .. ")")
-				end
-				-- Recursively resolve any further IDs in the remainder.
-				local tail = DMV_ResolveCommentItems(remainder)
-				displayName = base .. tail
-			end
-			local factionFilter = DMV_Settings.bossFaction or "all"
-			local factionOK = (factionFilter == "all")
-				or (pinFaction == nil)
-				or (factionFilter == "Alliance" and pinFaction == "Alliance")
-				or (factionFilter == "Horde"	and pinFaction == "Horde")
-			if excludeIfAtlas and not Atlas_Refresh then
-				-- skip pin; only shown when Atlas is present
-			elseif useAltTexture and not DMV_Settings.bossPinAlt then
-				-- skip quest pins when disabled
-			elseif useLootTexture and not DMV_Settings.bossPinLoot then
-				-- skip loot pins when disabled
-			elseif useObjectTexture and not DMV_Settings.bossPinObject then
-				-- skip object pins when disabled
-			elseif not useAltTexture and not useLootTexture and not useObjectTexture
-				and not DMV_Settings.bossPins then
-				-- skip regular boss pins when disabled
-			elseif not factionOK then
-				-- skip
-			else
+			local displayName = DMV_MarkerDisplayName(m)
 
 			pinIndex = pinIndex + 1
 			local pin = DMV_BossPins[pinIndex] or DMV_CreateBossPin(pinIndex)
-			pin:ClearAllPoints()
-			pin:SetPoint("CENTER", DMV_Container, "TOPLEFT", px, py)
+			local changed = pin.bossName ~= displayName or pin.comment ~= m.comment
+				or pin.removed ~= removed or pin.bossOrdinal ~= ordinal
+			if pin.px ~= px or pin.py ~= py then
+				pin:ClearAllPoints()
+				pin:SetPoint("CENTER", DMV_Container, "TOPLEFT", px, py)
+				pin.px, pin.py = px, py
+			end
 			pin.bossName = displayName
-			pin.comment = comment
-			pin.atlasKey = atlasKey
-			if type(atlasBossIndex) == "table" then
-				pin.atlasEntries = atlasBossIndex
+			pin.comment = m.comment
+			pin.atlasKey = m.atlasKey
+			if type(m.atlasBossIndex) == "table" then
+				pin.atlasEntries = m.atlasBossIndex
 				pin.atlasBossIndex = nil
 			else
 				pin.atlasEntries = nil
-				pin.atlasBossIndex = atlasBossIndex
+				pin.atlasBossIndex = m.atlasBossIndex
 			end
 			pin.instanceMapID = instanceMapID
 			pin.bossOrdinal = ordinal
 			pin.removed = removed
-			pin.altTexture = useAltTexture
-			pin.lootTexture = useLootTexture
-			pin.objectTexture = useObjectTexture
-			local tex = useObjectTexture and DMV_BOSS_PIN_TEXTURE_OBJECT
-				or (useLootTexture and DMV_BOSS_PIN_TEXTURE_LOOT
-				or (useAltTexture and DMV_BOSS_PIN_TEXTURE_ALT or DMV_BOSS_PIN_TEXTURE))
-			pin.icon:SetTexture(tex)
-			pin.highlight:SetTexture(tex)
-			local pinSize = (useAltTexture or useLootTexture or useObjectTexture)
-				and DMV_BOSS_PIN_SIZE_ALT or DMV_BOSS_PIN_SIZE
-			pin:SetSize(pinSize, pinSize)
+			pin.altTexture = m.alt
+			pin.lootTexture = m.loot
+			pin.objectTexture = m.object
+			local tex = m.object and DMV_BOSS_PIN_TEXTURE_OBJECT
+				or (m.loot and DMV_BOSS_PIN_TEXTURE_LOOT
+				or (m.alt and DMV_BOSS_PIN_TEXTURE_ALT or DMV_BOSS_PIN_TEXTURE))
+			if pin.texPath ~= tex then
+				pin.icon:SetTexture(tex)
+				pin.highlight:SetTexture(tex)
+				pin.texPath = tex
+			end
+			DMV_ApplyPinSize(pin)
 			if removed then
 				pin.icon:SetDesaturated(true)
 				pin.icon:SetVertexColor(1, 0.3, 0.3)
@@ -1672,16 +2239,20 @@ function DMV_ShowBossPins()
 				pin.icon:SetDesaturated(false)
 				pin.icon:SetVertexColor(1, 1, 1)
 			end
-			if DMV_CalibMode then
-				pin.label:SetText(tostring(atlasBossIndex))
-				pin.label:Show()
+			-- The label is drawn by DMV_OverlayDraw, so it is shown here only
+			-- for a pin that is already shown; pin:Show() shows it otherwise.
+			pin.labelOn = DMV_CalibMode and true or false
+			if pin.labelOn then
+				pin.label:SetText(tostring(m.atlasBossIndex))
+				if pin.dmvImagesShown then pin.label:Show() end
 			else
 				pin.label:Hide()
 			end
 			pin:Show()
-			end -- else (pin not skipped by setting)
+			if changed and pin.hovered and DMV_HoveredPin == pin then DMV_ShowPinTooltip(pin) end
 		end
 	end
+	DMV_HidePinsFrom(pinIndex + 1)
 end
 
 -- Show the dungeon map overlay
@@ -1705,16 +2276,27 @@ function DMV_ShowFrames()
 
 	DMV_UpdateFloorButtons()
 	if DMV_BossPinDropDown then
-		DMV_UpdateBossPinDropDown()
+		DMV_RefreshMarkerList()
 		if not DMV_Settings or DMV_Settings.showMarkersDropdown ~= false then
 			DMV_BossPinDropDown:Show()
 		end
 	end
-	pcall(DMV_HideBossPins)
-	pcall(DMV_ShowBossPins)
-	if not DMV_CoordsDisabled and (not DMV_Settings or DMV_Settings.showCoords ~= false) then
-		if DMV_CoordsFrame		 then DMV_CoordsFrame:Show()	   end
-		if DMV_PlayerCoordsFrame then DMV_PlayerCoordsFrame:Show() end
+	-- A marker data error must not stop the rest of the map from showing,
+	-- but it is still reported.
+	DMV_SafeCall(DMV_ShowBossPins)
+	DMV_ApplyOverlayLevels()
+	DMV_UpdateCoordsVisibility()
+end
+
+-- The coordinate frames are children of WorldMapFrame, so they must be
+-- hidden explicitly whenever the dungeon map is not displayed.
+function DMV_UpdateCoordsVisibility()
+	local show = DMV_Visible and (not DMV_Settings or DMV_Settings.showCoords ~= false)
+	if DMV_CoordsFrame then
+		if show then DMV_CoordsFrame:Show() else DMV_CoordsFrame:Hide() end
+	end
+	if DMV_PlayerCoordsFrame then
+		if show then DMV_PlayerCoordsFrame:Show() else DMV_PlayerCoordsFrame:Hide() end
 	end
 end
 
@@ -1737,8 +2319,6 @@ function DMV_HideFrames()
 	-- Hide and stop arrow updates
 	DMV_StopArrowUpdates()
 
-	SafeShow(GetContinentDropdown())
-	SafeShow(GetZoneDropdown())
 	if DMV_CoordsFrame		 then DMV_CoordsFrame:Hide()	   end
 	if DMV_PlayerCoordsFrame then DMV_PlayerCoordsFrame:Hide() end
 	DMV_Visible = false
@@ -1750,9 +2330,9 @@ function DMV_HideFrames()
 	end
 end
 
--- Leaving an instance (portal, hearth, death, logout) never closes the world
--- map while outside, so DMV_OnMapHide never gets the chance to clear the
--- instance browse state that DMV_OnMapShow set while inside the dungeon.
+-- Leaving an instance never closes the world map while outside, so 
+-- DMV_OnMapHide never gets the chance to clear the instance browse state that 
+-- DMV_OnMapShow set while inside the dungeon.
 -- The stale state made the hooked WorldMapZoneDropDown_Initialize keep
 -- listing instances, and Blizzard's SetSelectedID(GetCurrentMapZone()) then
 -- picked whatever instance sat at the real zone's index. Mirror the cleanup
@@ -1777,7 +2357,6 @@ function DMV_OnEnterWorld()
 			DMV_PrevPos.x = nil
 			DMV_PrevPos.y = nil
 			DMV_PrevPos.z = nil
-			if DMV_Settings then DMV_Settings.activeTransition = nil end
 			local savedFloor = DMV_LastKnownFloor[instanceMapID]
 			local floor = savedFloor or 1
 
@@ -1812,51 +2391,72 @@ function DMV_OnEnterWorld()
 		-- Player has left all dungeons. Wipe persisted floor memory so a
 		-- future visit starts fresh instead of restoring a stale floor.
 		DMV_LastKnownFloor = {}
-		if DMV_Settings then
-			DMV_Settings.logoutSnapshot  = nil
-			DMV_Settings.activeTransition = nil
-		end
+		if DMV_Settings then DMV_Settings.logoutSnapshot = nil end
 		DMV_CurrentDungeon = nil
 		DMV_HideFrames()
 		DMV_ResetBrowseStateOnInstanceExit()
 	end
 end
 
--- Event handler: Zone changed indoors (floor switching)
+-- Background ticker for coordinate-based floor transitions
+-- (subzone-name transitions are handled on ZONE_CHANGED* events).
 local DMV_TransitionElapsed = 0
 local DMV_TRANSITION_INTERVAL = 0.1  -- 10 checks per second
 
+-- The ticker only runs while the player is inside a supported dungeon/raid.
+-- Entering or leaving an instance always passes through a loading screen
+-- (PLAYER_ENTERING_WORLD), which is where it is started or stopped, so the
+-- per-tick GetInstanceInfo() gate is no longer needed.
+local DMV_TransitionTickerRunning = false
+
+local function DMV_TransitionOnUpdate(self, elapsed)
+	-- Positional elapsed (ClassicAPI) or the legacy arg1 global.
+	elapsed = tonumber(elapsed) or tonumber(arg1) or 0
+	DMV_TransitionElapsed = DMV_TransitionElapsed + elapsed
+	if DMV_TransitionElapsed >= DMV_TRANSITION_INTERVAL then
+		DMV_TransitionElapsed = 0
+		DMV_DetectFloorFromPosition()
+	end
+end
+
 function DMV_StartTransitionTicker()
-	if DMV_TransitionFrame then return end
-	DMV_TransitionFrame = CreateFrame("Frame", "DMV_TransitionFrame")
-	DMV_TransitionFrame:SetScript("OnUpdate", function(self, elapsed)
-		-- ClassicAPI may expose the OnUpdate delta through legacy arg1.
-		elapsed = tonumber(elapsed) or tonumber(arg1) or 0
-		DMV_TransitionElapsed = DMV_TransitionElapsed + elapsed
-		if DMV_TransitionElapsed >= DMV_TRANSITION_INTERVAL then
-			DMV_TransitionElapsed = 0
-			local _, instanceType = GetInstanceInfo()
-			if instanceType == "party" or instanceType == "raid" then
-				DMV_DetectFloorFromPosition()
-			end
-		end
-	end)
+	if DMV_TransitionTickerRunning then return end
+	if not DMV_TransitionFrame then
+		DMV_TransitionFrame = CreateFrame("Frame", "DMV_TransitionFrame")
+	end
+	DMV_TransitionElapsed = 0
+	DMV_TransitionFrame:SetScript("OnUpdate", DMV_TransitionOnUpdate)
+	DMV_TransitionTickerRunning = true
 end
 
 function DMV_StopTransitionTicker()
 	if DMV_TransitionFrame then
 		DMV_TransitionFrame:SetScript("OnUpdate", nil)
-		DMV_TransitionFrame = nil
-		DMV_TransitionElapsed = 0
+	end
+	DMV_TransitionElapsed = 0
+	DMV_TransitionTickerRunning = false
+end
+
+-- Start the ticker in supported instances, stop it everywhere else.
+function DMV_UpdateTransitionTickerState()
+	local instanceType, instanceMapID = DMV_GetInstanceCached()
+	if (instanceType == "party" or instanceType == "raid")
+			and instanceMapID and DMV_DungeonByMapID[instanceMapID]
+			and DMV_FloorTransitions and DMV_FloorTransitions[instanceMapID] then
+		DMV_StartTransitionTicker()
+	else
+		DMV_StopTransitionTicker()
 	end
 end
 
--- Detect the correct floor by checking which rect's coordinate bounds
--- contain the player's current world position. This handles dungeons where
--- subzone names don't change between floors.
+-- The floor the player is physically on (read by DMV_FloorSync.lua).
+function DMV_GetActualFloor()
+	return DMV_ActualFloor
+end
+
 -- Resolve the dungeon the player is physically inside (never the previewed one).
 function DMV_GetRealDungeon()
-	local _, instanceType, _, _, _, _, _, instanceMapID = GetInstanceInfo()
+	local instanceType, instanceMapID = DMV_GetInstanceCached()
 	if instanceType ~= "party" and instanceType ~= "raid" then return nil end
 	local entry = instanceMapID and DMV_DungeonByMapID[instanceMapID]
 	return entry and entry[1]
@@ -1888,9 +2488,31 @@ function DMV_ApplyRealFloorChange(toFloor)
 	end
 end
 
+-- Did one axis cross its threshold between two samples? nil = axis unused.
+local function DMV_CheckAxis(prev, cur, threshold, dir)
+	if not threshold then return nil end
+	if dir == "lt" then
+		return prev >= threshold and cur < threshold
+	elseif dir == "eq" then
+		return math.abs(cur - threshold) < 0.01
+	else -- "gt" (default)
+		return prev <= threshold and cur > threshold
+	end
+end
+
+-- Compare area names ignoring spaces and curly vs straight apostrophes.
+local function DMV_NormalizeAreaName(s)
+	s = string.gsub(s, " ", "")
+	s = string.gsub(s, "\226\128\153", "'")	-- U+2019 right single quotation mark
+	s = string.gsub(s, "\226\128\152", "'")	-- U+2018 left single quotation mark
+	return s
+end
+
+-- Fire coordinate-based floor transitions (DMV_FloorTransitions) when the
+-- player's world position crosses a threshold since the previous sample.
 function DMV_DetectFloorFromPosition()
 	if not DMV_GetRealDungeon() then return end
-	local _, _, _, _, _, _, _, instanceMapID = GetInstanceInfo()
+	local _, instanceMapID = DMV_GetInstanceCached()
 	if not instanceMapID then return end
 
 	local transitions = DMV_FloorTransitions and DMV_FloorTransitions[instanceMapID]
@@ -1916,18 +2538,7 @@ function DMV_DetectFloorFromPosition()
 
 			-- Detect crossing on the primary axis (up to two may be specified;
 			-- both must be crossed for the transition to fire).
-			local function checkAxis(prev, cur, threshold, dir)
-				if not threshold then return nil end
-				dir = dir or "gt"
-				if dir == "lt" then
-					return prev >= threshold and cur < threshold
-				elseif dir == "eq" then
-					return math.abs(cur - threshold) < 0.01
-				else -- "gt"
-					return prev <= threshold and cur > threshold
-				end
-			end
-
+			local checkAxis = DMV_CheckAxis
 			local r1, r2 = nil, nil
 			local axisCount = 0
 
@@ -1961,23 +2572,15 @@ function DMV_DetectFloorFromPosition()
 				if t.zMax and posZ and posZ > t.zMax then inBounds = false end
 				if t.subzone and t.subzoneMode == "condition" then
 					local sz = GetMinimapZoneText() or GetSubZoneText() or GetZoneText() or ""
-					local norm = sz:gsub(" ", ""):gsub("'", "'")
-					local resolvedSubzone = (L and L[t.subzone] and L[t.subzone] ~= "") and L[t.subzone] or t.subzone
-					local tNorm = resolvedSubzone:gsub(" ", ""):gsub("'", "'")
-					if norm ~= tNorm and sz ~= resolvedSubzone then inBounds = false end
+					-- t.subzone is already translated (DungeonData uses L[...]).
+					if sz ~= t.subzone
+					   and DMV_NormalizeAreaName(sz) ~= DMV_NormalizeAreaName(t.subzone) then
+						inBounds = false
+					end
 				end
 
 				if inBounds then
 					local toFloor = t.toFloor
-					-- Save transition to SavedVariables so the correct floor
-					-- is immediately available when the map is opened.
-					if not DMV_Settings then DMV_Settings = {} end
-					DMV_Settings.activeTransition = {
-						instanceMapID = instanceMapID,
-						floor		  = toFloor,
-						posX		  = posX,
-						posY		  = posY,
-					}
 					-- Update prevPos BEFORE returning so the next tick does
 					-- not re-evaluate this same crossing with a stale position
 					-- and inadvertently chain into the next transition.
@@ -2011,37 +2614,30 @@ function DMV_OnZoneChanged()
 		GetZoneText(),
 	}
 
-	-- Collect all non-empty candidate strings as a set for transition matching.
+	-- Collect all non-empty candidate strings as a set for transition matching,
+	-- both raw and normalised (no spaces, straight apostrophes).
 	local candidateSet = {}
 	for _, subzone in ipairs(candidates) do
 		if subzone and subzone ~= "" then
 			candidateSet[subzone] = true
-			candidateSet[subzone:gsub(" ", "")] = true
-			candidateSet[subzone:gsub(" ", ""):gsub("'", "'")] = true
+			candidateSet[DMV_NormalizeAreaName(subzone)] = true
 		end
 	end
 
 	-- Check DMV_FloorTransitions for subzone trigger entries (subzoneMode ~= "condition").
 	-- These respect fromFloor just like coordinate transitions.
-	local _, _, _, _, _, _, _, instanceMapID = GetInstanceInfo()
+	-- t.subzone is already translated (DungeonData uses L[...]).
+	local _, instanceMapID = DMV_GetInstanceCached()
 	local transitions = DMV_FloorTransitions and instanceMapID and DMV_FloorTransitions[instanceMapID]
 	if transitions then
 		for _, t in ipairs(transitions) do
 			local tSubzone = t.subzone
-			if tSubzone and L and L[tSubzone] and L[tSubzone] ~= "" then
-				tSubzone = L[tSubzone]
-			end
 			if tSubzone
 			   and t.subzoneMode ~= "condition"
 			   and (not t.fromFloor or t.fromFloor == DMV_ActualFloor)
-			   and candidateSet[tSubzone] then
+			   and (candidateSet[tSubzone] or candidateSet[DMV_NormalizeAreaName(tSubzone)]) then
 				local toFloor = t.toFloor
 				if toFloor ~= DMV_ActualFloor then
-					if not DMV_Settings then DMV_Settings = {} end
-					DMV_Settings.activeTransition = {
-						instanceMapID = instanceMapID,
-						floor		  = toFloor,
-					}
 					DMV_LastKnownFloor[instanceMapID] = toFloor
 					DMV_ActualFloor = toFloor
 					DMV_ApplyRealFloorChange(toFloor)
@@ -2059,131 +2655,34 @@ end
 -- NPCs/objects/quests: sliding window of concurrent RequestLoad* calls.
 -- Each result event calls DMV_PreloadGeneric_Next to keep the window full.
 -- Window size matches MobInfo2's MI2_CREATURE_WINDOW (32).
--- Items: one SetHyperlink call per OnUpdate frame on a hidden GameTooltip,
--- identical to MobInfo2/aux populate_wdb.  After the queue drains, a sweep
--- reads GetItemNameByID for anything that didn't fire GET_ITEM_INFO_RECEIVED.
-local DMV_PRELOAD_WINDOW = 32
+-- Items: one C_Item.GetItemNameByID per OnUpdate frame; on a cache miss it
+-- starts the load itself and GET_ITEM_INFO_RECEIVED fires when it lands.
+local DMV_PRELOAD_WINDOW  = 32
+-- The server silently drops queries for quests it will not send (invalid
+-- IDs, quests the character can never take), so no result event ever comes.
+-- Requests still unanswered after this many seconds give up their slot.
+local DMV_PRELOAD_TIMEOUT = 30
 
--- Generic (n/o/q) queue
-local DMV_PreloadQueue	 = nil	 -- array of idStr e.g. "n11324"
-local DMV_PreloadPending = 0
+-- Every ID DungeonData references, built once from the static data.
+local DMV_RefGeneric, DMV_RefItems, DMV_RefIDs = nil, nil, nil
 
-local function DMV_PreloadGeneric_Next()
-	if not DMV_PreloadQueue then return end
-	while DMV_PreloadPending < DMV_PRELOAD_WINDOW
-			and table.getn(DMV_PreloadQueue) > 0 do
-		local idStr = DMV_PreloadQueue[table.getn(DMV_PreloadQueue)]
-		local prefix = string.sub(idStr, 1, 1)
-		local id	 = tonumber(string.sub(idStr, 2))
-		-- skip if already in DMV_NameCache (synchronous hit on a prior pass)
-		if DMV_NameCache[idStr] then
-			DMV_PreloadQueue[table.getn(DMV_PreloadQueue)] = nil
-		else
-			local ok
-			if prefix == "n" then
-				-- peek first; may already be in the client cache
-				local info = C_CreatureInfo.GetCreatureInfoByID(id)
-				if info and info.name then
-					DMV_NameCache[idStr] = info.name
-					DMV_PreloadQueue[table.getn(DMV_PreloadQueue)] = nil
-				else
-					DMV_PreloadPending = DMV_PreloadPending + 1
-					ok = C_CreatureInfo.RequestLoadCreatureByID(id)
-					DMV_PreloadQueue[table.getn(DMV_PreloadQueue)] = nil
-					if not ok then
-						DMV_PreloadPending = DMV_PreloadPending - 1
-						break  -- pending set full; wait for a slot
-					end
-				end
-			elseif prefix == "o" then
-				local info = C_GameObjectInfo.GetGameObjectInfoByID(id)
-				if info and info.name then
-					DMV_NameCache[idStr] = info.name
-					DMV_PreloadQueue[table.getn(DMV_PreloadQueue)] = nil
-				else
-					DMV_PreloadPending = DMV_PreloadPending + 1
-					ok = C_GameObjectInfo.RequestLoadGameObjectByID(id)
-					DMV_PreloadQueue[table.getn(DMV_PreloadQueue)] = nil
-					if not ok then
-						DMV_PreloadPending = DMV_PreloadPending - 1
-						break
-					end
-				end
-			elseif prefix == "q" then
-				local details = C_QuestLog.GetQuestDetails(id)
-				if details and details.title then
-					DMV_NameCache[idStr] = { details.title, details.level or 0 }
-					DMV_PreloadQueue[table.getn(DMV_PreloadQueue)] = nil
-				else
-					DMV_PreloadPending = DMV_PreloadPending + 1
-					ok = C_QuestLog.RequestLoadQuestByID(id)
-					DMV_PreloadQueue[table.getn(DMV_PreloadQueue)] = nil
-					if not ok then
-						DMV_PreloadPending = DMV_PreloadPending - 1
-						break
-					end
-				end
-			else
-				DMV_PreloadQueue[table.getn(DMV_PreloadQueue)] = nil
-			end
+local function DMV_BuildReferencedIDs()
+	if DMV_RefIDs then return end
+	DMV_RefGeneric, DMV_RefItems, DMV_RefIDs = {}, {}, {}
+	local function addGeneric(idStr)
+		if not DMV_RefIDs[idStr] then
+			DMV_RefIDs[idStr] = true
+			DMV_RefGeneric[table.getn(DMV_RefGeneric) + 1] = idStr
 		end
 	end
-	if DMV_PreloadQueue and table.getn(DMV_PreloadQueue) == 0 then
-		DMV_PreloadQueue = nil
+	local function addItem(digits)
+		local id = tonumber(digits)
+		if id and not DMV_RefIDs["i" .. id] then
+			DMV_RefIDs["i" .. id] = true
+			DMV_RefItems[table.getn(DMV_RefItems) + 1] = id
+		end
 	end
-end
-
--- Item queue
--- Hidden GameTooltip used to force the client to load item data into the WDB,
--- matching MobInfo2's MI2_ItemCacheTooltip/aux populate_wdb technique.
-local DMV_ItemCacheTooltip = CreateFrame("GameTooltip", "DMV_ItemCacheTooltip", UIParent, "GameTooltipTemplate")
-DMV_ItemCacheTooltip:Hide()
-
-local DMV_ItemPreloadQueue = nil  -- array of raw item IDs (numbers)
-
-local function DMV_PreloadItems_Start()
-	if not DMV_ItemPreloadQueue or table.getn(DMV_ItemPreloadQueue) == 0 then return end
-
-	local idx = 1
-	DMV_ItemCacheTooltip:SetOwner(UIParent, "ANCHOR_NONE")
-
-	local frame = CreateFrame("Frame")
-	frame:SetScript("OnUpdate", function()
-		if idx > table.getn(DMV_ItemPreloadQueue) then
-			-- Queue drained. Sweep for items that didn't fire GET_ITEM_INFO_RECEIVED.
-			frame:SetScript("OnUpdate", nil)
-			DMV_ItemCacheTooltip:Hide()
-			for _, itemID in ipairs(DMV_ItemPreloadQueue) do
-				local idStr = "i" .. itemID
-				if not DMV_NameCache[idStr] then
-					local iname   = C_Item.GetItemNameByID(itemID)
-					local quality = C_Item.GetItemQualityByID(itemID)
-					if iname then
-						DMV_NameCache[idStr] = { iname, quality or 1 }
-					end
-				end
-			end
-			DMV_ItemPreloadQueue = nil
-			return
-		end
-		local itemID = DMV_ItemPreloadQueue[idx]
-		local idStr  = "i" .. itemID
-		if not DMV_NameCache[idStr] and not C_Item.IsItemDataCachedByID(itemID) then
-			DMV_ItemCacheTooltip:SetHyperlink("item:" .. itemID)
-		end
-		idx = idx + 1
-	end)
-end
-
--- Collect all IDs from DungeonData and kick off both queues
-local function DMV_WarmupCache()
 	if not DMV_Markers then return end
-
-	local seenGeneric = {}
-	local seenItem	  = {}
-	local genericQueue = {}
-	local itemQueue    = {}
-
 	for _, data in pairs(DMV_Markers) do
 		for _, boss in ipairs(data) do
 			-- name field: strip !, A , H  prefixes then check for ID prefix
@@ -2193,59 +2692,253 @@ local function DMV_WarmupCache()
 				name = string.gsub(name, "^[AH] ", "")
 				-- Scan all n/o/q/i tokens from the name field (there may be
 				-- multiple, e.g. "n3864 / n3865").
-				for p, d in string.gmatch(name, "([noq])(%d+)") do
-					local idStr = p .. d
-					if not seenGeneric[idStr] then
-						seenGeneric[idStr] = true
-						genericQueue[table.getn(genericQueue) + 1] = idStr
-					end
-				end
-				for d in string.gmatch(name, "i(%d+)") do
-					local id = tonumber(d)
-					if id and not seenItem[id] then
-						seenItem[id] = true
-						itemQueue[table.getn(itemQueue) + 1] = id
-					end
-				end
+				for p, d in string.gmatch(name, "([noq])(%d+)") do addGeneric(p .. d) end
+				for d in string.gmatch(name, "i(%d+)") do addItem(d) end
 			end
-			-- comment field: scan for all n/o/q/i <id> tokens
+			-- comment field: scan for all n/o/q/i <id> tokens (same rule as
+			-- DMV_ResolveCommentItems: a token right after "|" is not an ID)
 			local comment = boss[7]
 			if comment then
-				for prefix, digits in string.gmatch(comment, "([noqi])(%d+)") do
-					if prefix == "i" then
-						local id = tonumber(digits)
-						if id and not seenItem[id] then
-							seenItem[id] = true
-							itemQueue[table.getn(itemQueue) + 1] = id
-						end
+				for pipe, prefix, digits in string.gmatch(comment, "(|?)([noqi])(%d+)") do
+					if pipe ~= "" then
+						-- "|n" line break followed by a number
+					elseif prefix == "i" then
+						addItem(digits)
 					else
-						local idStr = prefix .. digits
-						if not seenGeneric[idStr] then
-							seenGeneric[idStr] = true
-							genericQueue[table.getn(genericQueue) + 1] = idStr
-						end
+						addGeneric(prefix .. digits)
 					end
 				end
 			end
 		end
 	end
+end
 
-	if table.getn(genericQueue) > 0 then
-		DMV_PreloadQueue   = genericQueue
-		DMV_PreloadPending = 0
-		DMV_PreloadGeneric_Next()
+-- True for IDs DMV itself references or has asked for. Result events for
+-- other addons' lookups are ignored: they are not cached and do not trigger
+-- marker redraws.
+local function DMV_IsTrackedID(idStr)
+	DMV_BuildReferencedIDs()
+	return DMV_RefIDs[idStr] or DMV_NameCache[idStr] == false
+end
+
+-- Generic (n/o/q) queue
+local DMV_PreloadQueue	  = nil	 -- array of idStr e.g. "n11324"
+local DMV_PreloadPending  = 0	 -- preload requests still waiting for a result
+local DMV_PreloadInFlight = {}	 -- [idStr] = GetTime() of the request
+local DMV_PreloadTimedOut = {}	 -- [idStr] = true: gave up this session
+local DMV_PreloadBusy	  = false
+local DMV_PreloadWatchdog = nil	 -- frame shown while requests are in flight
+
+-- Called from the *_DATA_LOAD_RESULT handlers. Only results for requests the
+-- preload itself issued free a window slot; results for lazy lookups or other
+-- addons' requests must not.
+local function DMV_PreloadGeneric_Done(idStr)
+	if DMV_PreloadInFlight[idStr] then
+		DMV_PreloadInFlight[idStr] = nil
+		DMV_PreloadPending = DMV_PreloadPending - 1
+		if DMV_PreloadPending <= 0 and DMV_PreloadWatchdog then DMV_PreloadWatchdog:Hide() end
+	end
+end
+
+local DMV_PreloadGeneric_Next
+
+local function DMV_StartPreloadWatchdog()
+	if not DMV_PreloadWatchdog then
+		local f = CreateFrame("Frame")
+		f.elapsed = 0
+		f:SetScript("OnUpdate", function(self, elapsed)
+			elapsed = tonumber(elapsed) or tonumber(arg1) or 0
+			f.elapsed = f.elapsed + elapsed
+			if f.elapsed < 1 then return end
+			f.elapsed = 0
+			local now = GetTime()
+			local expired = false
+			for idStr, t in pairs(DMV_PreloadInFlight) do
+				if now - t >= DMV_PRELOAD_TIMEOUT then
+					DMV_PreloadTimedOut[idStr] = true
+					expired = true
+				end
+			end
+			if expired then
+				for idStr in pairs(DMV_PreloadTimedOut) do DMV_PreloadGeneric_Done(idStr) end
+				DMV_PreloadGeneric_Next()
+			end
+			if DMV_PreloadPending <= 0 then f:Hide() end
+		end)
+		DMV_PreloadWatchdog = f
+	end
+	DMV_PreloadWatchdog:Show()
+end
+
+-- Issue one request and track it. Returns false if it was not accepted.
+-- RequestLoadQuestByID returns nothing, so a quest request counts as accepted.
+local function DMV_PreloadRequest(prefix, id, idStr)
+	DMV_PreloadInFlight[idStr] = GetTime()	-- before the call: a cache hit fires the event synchronously
+	DMV_PreloadPending = DMV_PreloadPending + 1
+	local ok = true
+	if prefix == "n" then
+		ok = C_CreatureInfo.RequestLoadCreatureByID(id)
+	elseif prefix == "o" then
+		ok = C_GameObjectInfo.RequestLoadGameObjectByID(id)
+	else
+		C_QuestLog.RequestLoadQuestByID(id)
+	end
+	if not ok then
+		DMV_PreloadGeneric_Done(idStr)	-- bad input or the engine's pending set is full
+		return false
+	end
+	if DMV_PreloadInFlight[idStr] then DMV_StartPreloadWatchdog() end
+	return true
+end
+
+DMV_PreloadGeneric_Next = function()
+	-- A synchronous result event re-enters here; the running loop already
+	-- re-checks the window on every pass, so the nested call can return.
+	if DMV_PreloadBusy then return end
+	DMV_PreloadBusy = true
+	local queue = DMV_PreloadQueue
+	while queue and DMV_PreloadPending < DMV_PRELOAD_WINDOW and table.getn(queue) > 0 do
+		local n = table.getn(queue)
+		local idStr = queue[n]
+		queue[n] = nil
+		local prefix = string.sub(idStr, 1, 1)
+		local id	 = tonumber(string.sub(idStr, 2))
+		-- Skip IDs already resolved, in flight or given up; otherwise peek the
+		-- client cache before sending a request.
+		if not DMV_NameCache[idStr] and not DMV_PreloadInFlight[idStr]
+		   and not DMV_PreloadTimedOut[idStr] and id then
+			if prefix == "n" then
+				local info = C_CreatureInfo.GetCreatureInfoByID(id)
+				if info and info.name then
+					DMV_NameCache[idStr] = info.name
+				elseif not DMV_PreloadRequest(prefix, id, idStr) then
+					-- Not accepted: retry it last, after the next result event
+					-- (or the next loading screen if nothing is in flight).
+					table.insert(queue, 1, idStr)
+					break
+				end
+			elseif prefix == "o" then
+				local info = C_GameObjectInfo.GetGameObjectInfoByID(id)
+				if info and info.name then
+					DMV_NameCache[idStr] = info.name
+				elseif not DMV_PreloadRequest(prefix, id, idStr) then
+					table.insert(queue, 1, idStr)
+					break
+				end
+			elseif prefix == "q" then
+				local details = C_QuestLog.GetQuestDetails(id)
+				if details and details.title then
+					DMV_NameCache[idStr] = { details.title, details.level or 0 }
+				else
+					DMV_PreloadRequest(prefix, id, idStr)
+				end
+			end
+		end
+	end
+	if queue and table.getn(queue) == 0 and DMV_PreloadQueue == queue then
+		DMV_PreloadQueue = nil
+	end
+	DMV_PreloadBusy = false
+end
+
+-- Item queue
+local DMV_ItemPreloadQueue = nil  -- array of raw item IDs (numbers)
+local DMV_ItemPreloadIdx   = 1
+local DMV_ItemPreloadFrame = nil  -- one reusable driver frame
+
+local function DMV_ItemPreload_OnUpdate()
+	local queue = DMV_ItemPreloadQueue
+	if not queue or DMV_ItemPreloadIdx > table.getn(queue) then
+		DMV_ItemPreloadFrame:SetScript("OnUpdate", nil)
+		DMV_ItemPreloadQueue = nil
+		return
+	end
+	local itemID = queue[DMV_ItemPreloadIdx]
+	DMV_ItemPreloadIdx = DMV_ItemPreloadIdx + 1
+	local idStr = "i" .. itemID
+	if not DMV_NameCache[idStr] then
+		-- A cache miss starts the load; GET_ITEM_INFO_RECEIVED caches the name.
+		local iname = C_Item.GetItemNameByID(itemID)
+		if iname then
+			DMV_NameCache[idStr] = { iname, C_Item.GetItemQualityByID(itemID) or 1 }
+		end
+	end
+end
+
+local function DMV_PreloadItems_Start()
+	if not DMV_ItemPreloadQueue or table.getn(DMV_ItemPreloadQueue) == 0 then return end
+	DMV_ItemPreloadIdx = 1
+	if not DMV_ItemPreloadFrame then
+		DMV_ItemPreloadFrame = CreateFrame("Frame")
+	end
+	DMV_ItemPreloadFrame:SetScript("OnUpdate", DMV_ItemPreload_OnUpdate)
+end
+
+-- Kick off both queues for every referenced ID that is not resolved yet.
+local function DMV_WarmupCache()
+	DMV_BuildReferencedIDs()
+
+	-- This runs on every loading screen. A queue that is still draining is
+	-- kept (and resumed if a rejected request left nothing in flight), and
+	-- IDs that are already resolved are not queued again.
+	if DMV_PreloadQueue then
+		if DMV_PreloadPending == 0 then DMV_PreloadGeneric_Next() end
+	else
+		local pending = {}
+		for i = 1, table.getn(DMV_RefGeneric) do
+			local idStr = DMV_RefGeneric[i]
+			if not DMV_NameCache[idStr] and not DMV_PreloadTimedOut[idStr] then
+				pending[table.getn(pending) + 1] = idStr
+			end
+		end
+		if table.getn(pending) > 0 then
+			DMV_PreloadQueue = pending
+			DMV_PreloadGeneric_Next()
+		end
 	end
 
-	if table.getn(itemQueue) > 0 then
-		DMV_ItemPreloadQueue = itemQueue
-		DMV_PreloadItems_Start()
+	if not DMV_ItemPreloadQueue then
+		local pending = {}
+		for i = 1, table.getn(DMV_RefItems) do
+			if not DMV_NameCache["i" .. DMV_RefItems[i]] then pending[table.getn(pending) + 1] = DMV_RefItems[i] end
+		end
+		if table.getn(pending) > 0 then
+			DMV_ItemPreloadQueue = pending
+			DMV_PreloadItems_Start()
+		end
 	end
+end
+
+-- Marker redraw after name lookups resolve. Lookups can complete dozens of
+-- times per frame during warmup, so redraws are merged into one per frame.
+-- An open marker tooltip is rebuilt too, so names in its comment appear.
+local DMV_PinRefreshFrame = CreateFrame("Frame")
+DMV_PinRefreshFrame:Hide()
+DMV_PinRefreshFrame:SetScript("OnUpdate", function()
+	DMV_PinRefreshFrame:Hide()
+	if DMV_Visible and DMV_CurrentDungeon then
+		DMV_SafeCall(DMV_ShowBossPins)
+		DMV_RefreshPinTooltip()
+	end
+end)
+
+local function DMV_QueuePinRefresh()
+	if DMV_Visible and DMV_CurrentDungeon then DMV_PinRefreshFrame:Show() end
+end
+
+-- Result of a creature/object/quest lookup.
+local function DMV_OnGenericResult(idStr, name)
+	if not DMV_IsTrackedID(idStr) then return end
+	DMV_NameCache[idStr] = name or idStr	-- failed lookups keep the raw token
+	DMV_PreloadTimedOut[idStr] = nil
+	DMV_PreloadGeneric_Done(idStr)
+	DMV_QueuePinRefresh()
 end
 
 -- Main event frame
 local EventFrame = CreateFrame("Frame", "DMV_EventFrame", UIParent)
 
-EventFrame:RegisterEvent("ADDON_LOADED") -- fires for both Atlas and DungeonMapsVanilla
+EventFrame:RegisterEvent("ADDON_LOADED")
 EventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 EventFrame:RegisterEvent("PLAYER_LOGOUT")
 EventFrame:RegisterEvent("ZONE_CHANGED_INDOORS")
@@ -2264,13 +2957,7 @@ EventFrame:SetScript("OnEvent", function(self, event, arg1, arg2)
 	if arg1 == nil then arg1 = _G.arg1 end
 	if arg2 == nil then arg2 = _G.arg2 end
 
-	if event == "ADDON_LOADED" and arg1 == "Atlas" then
-		-- When AtlasFrame is closed, restore its frame level to the default (0)
-		-- so subsequent non-DMV opens are unaffected.
-		AtlasFrame:HookScript("OnHide", function()
-			AtlasFrame:SetFrameStrata("MEDIUM")
-		end)
-	elseif event == "ADDON_LOADED" and arg1 == "DungeonMapsVanilla" then
+	if event == "ADDON_LOADED" and arg1 == "DungeonMapsVanilla" then
 		if not DMV_Settings then DMV_Settings = {} end
 		if DMV_Settings.bossPins	== nil then DMV_Settings.bossPins	 = true end
 		if DMV_Settings.bossPinAlt	== nil then DMV_Settings.bossPinAlt  = true end
@@ -2280,6 +2967,8 @@ EventFrame:SetScript("OnEvent", function(self, event, arg1, arg2)
 		if DMV_Settings.overlayScale == nil then DMV_Settings.overlayScale = 1.0 end
 		if DMV_Settings.showPartyBlips == nil then DMV_Settings.showPartyBlips = true end
 		if DMV_Settings.showRaidBlips  == nil then DMV_Settings.showRaidBlips  = true end
+		-- No longer used (the live floor and the logout snapshot cover it).
+		DMV_Settings.activeTransition = nil
 		if not DMV_GlobalSettings then DMV_GlobalSettings = {} end
 		if DMV_GlobalSettings.bossPinOverrides == nil then DMV_GlobalSettings.bossPinOverrides = {} end
 		-- ADDON_LOADED is the reliable point at which the addon's code and
@@ -2291,6 +2980,7 @@ EventFrame:SetScript("OnEvent", function(self, event, arg1, arg2)
 		DMV_PlayerFaction = nil
 		-- Restore floor snapshot saved at logout/reload so DMV_OnEnterWorld
 		-- picks up the correct floor via DMV_LastKnownFloor.
+		DMV_RefreshInstanceCache()
 		local snap = DMV_Settings and DMV_Settings.logoutSnapshot
 		if snap and snap.instanceMapID and snap.floor then
 			DMV_LastKnownFloor[snap.instanceMapID] = snap.floor
@@ -2299,35 +2989,26 @@ EventFrame:SetScript("OnEvent", function(self, event, arg1, arg2)
 		-- Clear the snapshot after consuming it so a fresh login to a
 		-- different dungeon is not affected by stale data.
 		if DMV_Settings then DMV_Settings.logoutSnapshot = nil end
-		-- Start the background transition ticker; it self-gates via GetInstanceInfo().
-		DMV_StartTransitionTicker()
+		-- Run the transition ticker only inside a supported dungeon/raid.
+		DMV_UpdateTransitionTickerState()
 		-- Warm up the name cache so all pin names and item comment tokens
 		-- are resolved before the player can open the map.
 		DMV_WarmupCache()
 	elseif event == "PLAYER_LOGOUT" then
-		-- Stop the ticker and wipe transition data when logging out.
+		-- Stop the ticker when logging out.
 		DMV_StopTransitionTicker()
 		if not DMV_Settings then DMV_Settings = {} end
-		local _, instanceType, _, _, _, _, _, instanceMapID = GetInstanceInfo()
+		local instanceType, instanceMapID = DMV_GetInstanceCached()
 		if (instanceType == "party" or instanceType == "raid") and instanceMapID then
-			local posY, posX = UnitPosition("player")
 			DMV_Settings.logoutSnapshot = {
 				instanceMapID = instanceMapID,
 				floor		  = DMV_ActualFloor,
-				posX		  = posX,
-				posY		  = posY,
 			}
 		else
 			DMV_Settings.logoutSnapshot = nil
-			DMV_Settings.activeTransition = nil
 		end
 	elseif event == "ZONE_CHANGED_INDOORS" or event == "ZONE_CHANGED" or event == "MINIMAP_UPDATE_ZOOM" then
 		DMV_OnZoneChanged()
-		-- If the player has left the dungeon, wipe the active transition.
-		local _, instanceType = GetInstanceInfo()
-		if instanceType ~= "party" and instanceType ~= "raid" then
-			if DMV_Settings then DMV_Settings.activeTransition = nil end
-		end
 	elseif event == "WORLD_MAP_UPDATE" then
 		-- Maintain spoofed continent dropdown text during browse mode
 		if DMV_InstanceBrowseMode then
@@ -2338,78 +3019,49 @@ EventFrame:SetScript("OnEvent", function(self, event, arg1, arg2)
 		-- while the dungeon overlay is visible, hide the overlay so the selected
 		-- map shows through. DMV_OnMapShow will restore it when the map is
 		-- reopened or when the player navigates back to the dungeon.
+		-- Inside an instance (continent -1) it only stays if no zone index is
+		-- set. GetCurrentMapZone() returns 0 for "no zone", and 0 is true in Lua.
 		if DMV_Visible then
-			if GetCurrentMapContinent() ~= -1 then
+			if GetCurrentMapContinent() ~= -1 or (GetCurrentMapZone() or 0) > 0 then
 				DMV_HideFrames()
-			else
-				local mapZone = GetCurrentMapZone()
-				if mapZone and mapZone ~= GetRealZoneText() then
-					DMV_HideFrames()
-				end
 			end
 		end
 	elseif event == "CREATURE_DATA_LOAD_RESULT" then
 		-- arg1 = creatureID, arg2 = success (1 or nil)
-		if DMV_PreloadPending and DMV_PreloadPending > 0 then
-			DMV_PreloadPending = DMV_PreloadPending - 1
-		end
 		if arg1 then
-			local idStr = "n" .. arg1
-			if arg2 then
-				local info = C_CreatureInfo.GetCreatureInfoByID(arg1)
-				DMV_NameCache[idStr] = (info and info.name) or idStr
-			else
-				DMV_NameCache[idStr] = idStr  -- load failed; use raw string
-			end
-			if DMV_Visible and DMV_CurrentDungeon then pcall(DMV_ShowBossPins) end
+			local info = arg2 and C_CreatureInfo.GetCreatureInfoByID(arg1)
+			DMV_OnGenericResult("n" .. arg1, info and info.name)
 		end
 		DMV_PreloadGeneric_Next()
 	elseif event == "GAMEOBJECT_DATA_LOAD_RESULT" then
 		-- arg1 = gameObjectID, arg2 = success (1 or nil)
-		if DMV_PreloadPending and DMV_PreloadPending > 0 then
-			DMV_PreloadPending = DMV_PreloadPending - 1
-		end
 		if arg1 then
-			local idStr = "o" .. arg1
-			if arg2 then
-				local info = C_GameObjectInfo.GetGameObjectInfoByID(arg1)
-				DMV_NameCache[idStr] = (info and info.name) or idStr
-			else
-				DMV_NameCache[idStr] = idStr
-			end
-			if DMV_Visible and DMV_CurrentDungeon then pcall(DMV_ShowBossPins) end
+			local info = arg2 and C_GameObjectInfo.GetGameObjectInfoByID(arg1)
+			DMV_OnGenericResult("o" .. arg1, info and info.name)
 		end
 		DMV_PreloadGeneric_Next()
 	elseif event == "QUEST_DATA_LOAD_RESULT" then
 		-- arg1 = questID, arg2 = success (1 or nil)
-		if DMV_PreloadPending and DMV_PreloadPending > 0 then
-			DMV_PreloadPending = DMV_PreloadPending - 1
-		end
 		if arg1 then
 			local idStr = "q" .. arg1
-			if arg2 then
-				local details = C_QuestLog.GetQuestDetails(arg1)
-				if details and details.title then
-					DMV_NameCache[idStr] = { details.title, details.level or 0 }
-				else
-					DMV_NameCache[idStr] = idStr
-				end
+			local details = arg2 and C_QuestLog.GetQuestDetails(arg1)
+			if details and details.title then
+				DMV_OnGenericResult(idStr, { details.title, details.level or 0 })
 			else
-				DMV_NameCache[idStr] = idStr
+				DMV_OnGenericResult(idStr, nil)
 			end
-			if DMV_Visible and DMV_CurrentDungeon then pcall(DMV_ShowBossPins) end
 		end
 		DMV_PreloadGeneric_Next()
 	elseif event == "GET_ITEM_INFO_RECEIVED" then
 		-- arg1 = itemID, arg2 = success (1 or nil)
 		if arg1 and arg2 then
 			local idStr = "i" .. arg1
-			local iname   = C_Item.GetItemNameByID(arg1)
-			local quality = C_Item.GetItemQualityByID(arg1)
-			if iname then
-				DMV_NameCache[idStr] = { iname, quality or 1 }
-				if WorldMapTooltip:IsShown() then
-					WorldMapTooltip:Hide()
+			if DMV_IsTrackedID(idStr) then
+				local iname = C_Item.GetItemNameByID(arg1)
+				if iname then
+					DMV_NameCache[idStr] = { iname, C_Item.GetItemQualityByID(arg1) or 1 }
+					-- Redraws the markers and an open marker tooltip.
+					DMV_QueuePinRefresh()
 				end
 			end
 		end
@@ -2417,23 +3069,19 @@ EventFrame:SetScript("OnEvent", function(self, event, arg1, arg2)
 end)
 
 -- Hook WorldMapFrame: show overlay when map opens in a dungeon.
--- Load the active transition floor first so the correct floor is shown
--- immediately. Also restores actual floor if the player was browsing.
--- Uses both HookScript (for clients that preserve the chain) and a polling
--- fallback via DMV_OnMapVisibilityChanged for clients like Magnify that
--- replace OnShow with SetScript, breaking HookScript chains.
+-- Also restores actual floor if the player was browsing.
 local function DMV_OnMapShow()
 	if not DMV_Initialized then DMV_CreateFrames() end
 
-	local _, instanceType, _, _, _, _, _, instanceMapID = GetInstanceInfo()
-	
+	local instanceType, instanceMapID = DMV_GetInstanceCached()
+
 	-- Auto-detect and populate dropdowns when physically inside an instance
 	if (instanceType == "party" or instanceType == "raid") and instanceMapID then
 		local entry = DMV_DungeonByMapID[instanceMapID]
 		if entry then
 			DMV_CurrentDungeon = entry[1]
 			DMV_InstanceBrowseMode = entry[3] and "raid" or "dungeon"
-			
+
 			-- Find current instance ID in the sorted list
 			local list = DMV_BuildInstanceList(DMV_InstanceBrowseMode == "raid")
 			for i, item in ipairs(list) do
@@ -2442,25 +3090,13 @@ local function DMV_OnMapShow()
 					break
 				end
 			end
-			
-			if not DMV_ActualFloor or DMV_ActualFloor == 0 then
-				DMV_ActualFloor = DMV_LastKnownFloor[instanceMapID] or 1
-			end
 		end
 	end
 
 	if DMV_CurrentDungeon then
-		local tr = DMV_Settings and DMV_Settings.activeTransition
-		if tr and tr.instanceMapID == instanceMapID and tr.floor then
-			if tr.floor ~= DMV_ActualFloor then
-				DMV_LastKnownFloor[instanceMapID] = tr.floor
-				DMV_ActualFloor = tr.floor
-			end
-		end
-		
 		DMV_SetTextures(DMV_CurrentDungeon, DMV_ActualFloor or DMV_CurrentFloor)
 		DMV_ShowFrames()
-		
+
 		-- Force update dropdown labels for active instance
 		local continentDD = GetContinentDropdown()
 		if continentDD then
@@ -2476,6 +3112,8 @@ end
 
 local function DMV_OnMapHide()
 	DMV_Visible = false
+	DMV_ResetPinsOnMapHide()
+	DMV_UpdateCoordsVisibility()
 	if DMV_HideAreaList then DMV_HideAreaList() end
 	if DMV_HideMarkerList then DMV_HideMarkerList() end
 	if DMV_ClickFrame then DMV_ClickFrame:Hide() end
@@ -2487,7 +3125,7 @@ local function DMV_OnMapHide()
 	end
 
 	-- Only clear browse mode if NOT physically inside a dungeon or raid
-	local _, instanceType = GetInstanceInfo()
+	local instanceType = DMV_GetInstanceCached()
 	if instanceType ~= "party" and instanceType ~= "raid" then
 		DMV_ClearBrowseState()
 
@@ -2498,38 +3136,53 @@ local function DMV_OnMapHide()
 	end
 end
 
-WorldMapFrame:HookScript("OnShow", DMV_OnMapShow)
-WorldMapFrame:HookScript("OnHide", DMV_OnMapHide)
+-- Each map open and close is handled exactly once, whichever path sees it.
+local DMV_MapOpen = false
 
--- Polling fallback frame: always running, low cost (IsShown is cheap).
--- Catches map open/close events even when addons like Magnify overwrite
--- WorldMapFrame's OnShow/OnHide scripts via SetScript.
-DMV_MapWasVisible = false
-local DMV_MapPollFrame = CreateFrame("Frame", "DMV_MapPollFrame")
-DMV_MapPollFrame:SetScript("OnUpdate", function()
-	local visible = WorldMapFrame:IsShown()
-	if visible and not DMV_MapWasVisible then
-		DMV_MapWasVisible = true
-		if not DMV_Visible then
-			DMV_OnMapShow()
-		end
-	elseif not visible and DMV_MapWasVisible then
-		DMV_MapWasVisible = false
-		DMV_OnMapHide()
-	end
-end)
+local function DMV_MapShown()
+	if DMV_MapOpen then return end
+	DMV_MapOpen = true
+	DMV_OnMapShow()
+end
+
+local function DMV_MapHidden()
+	if not DMV_MapOpen then return end
+	DMV_MapOpen = false
+	DMV_OnMapHide()
+end
+
+-- Runs after WorldMapFrame's own OnShow/OnHide (so after the stock code has
+-- set the map to the current zone). The postcall binding survives addons
+-- that replace these scripts with SetScript (e.g. Magnify), so no polling
+-- is needed. Without it, a poll frame catches opens and closes that the
+-- plain hooks miss.
+local DMV_MapHooksPostcall = DMV_HookScriptPost(WorldMapFrame, "OnShow", DMV_MapShown)
+DMV_HookScriptPost(WorldMapFrame, "OnHide", DMV_MapHidden)
+
+if not DMV_MapHooksPostcall then
+	local DMV_MapPollFrame = CreateFrame("Frame", "DMV_MapPollFrame")
+	DMV_MapPollFrame:SetScript("OnUpdate", function()
+		if WorldMapFrame:IsVisible() then DMV_MapShown() else DMV_MapHidden() end
+	end)
+end
 
 -- Instance browser in continent/zone dropdowns
 -- Adds "Dungeons" and "Raids" entries to the continent dropdown.
 -- Selecting one populates the zone dropdown with a sorted list of
 -- instance names; selecting an instance enters preview mode for it.
 
--- "dungeon", "raid", or nil when a real continent is selected.
--- (DMV_InstanceBrowseMode/ContinentID/ZoneID declared at top of file)
+-- Browse state lives in DMV_InstanceBrowseMode ("dungeon", "raid" or nil)
+-- and DMV_InstanceZoneID, declared at the top of the file.
 
--- Build sorted { mapID, displayName } list for dungeons or raids.
+-- Sorted { mapID, name } list for dungeons or raids. DMV_DungeonByMapID is
+-- static, so each list is built once; callers must not modify it.
+local DMV_InstanceLists = {}
+
 function DMV_BuildInstanceList(raidsOnly)
-	local list = {}
+	local key = raidsOnly and "raid" or "dungeon"
+	local list = DMV_InstanceLists[key]
+	if list then return list end
+	list = {}
 	for mapID, entry in pairs(DMV_DungeonByMapID) do
 		local isRaid = entry[3]
 		if (raidsOnly and isRaid) or (not raidsOnly and not isRaid) then
@@ -2537,6 +3190,7 @@ function DMV_BuildInstanceList(raidsOnly)
 		end
 	end
 	table.sort(list, function(a, b) return a.name < b.name end)
+	DMV_InstanceLists[key] = list
 	return list
 end
 
@@ -2593,17 +3247,9 @@ WorldMapContinentsDropDown_Initialize = function()
 	end
 end
 
--- Intercept button addition to strip checkmarks from real continents when browsing instances
-local _origAddButton = UIDropDownMenu_AddButton
-UIDropDownMenu_AddButton = function(info, level)
-	if DMV_InstanceBrowseMode and level == 1 then
-		if info.text ~= L["Dungeons"] and info.text ~= L["Raids"] then
-			-- Force checked to explicit boolean false for real continents while browsing
-			info.checked = false
-		end
-	end
-	_origAddButton(info, level)
-end
+-- Real continents are left unchecked while browsing by the
+-- UIDropDownMenu_SetSelectedID(continentDD, dungeonID/raidID) calls above:
+-- that refresh redraws every checkmark from the selected ID.
 
 -- Hook zone dropdown to show instance names when a category is selected and manage checkmarks
 local _origZoneInit = WorldMapZoneDropDown_Initialize
@@ -2766,7 +3412,7 @@ function DMV_CreateInterfaceOptionsPanel()
 		if DMV_Settings then DMV_Settings.showMarkersDropdown = control:GetChecked() and true or false end
 		if DMV_BossPinDropDown then
 			if DMV_Settings and DMV_Settings.showMarkersDropdown ~= false then
-				if WorldMapFrame:IsVisible() and DMV_BossPinDropDown:IsVisible() ~= nil then
+				if DMV_Visible then
 					DMV_BossPinDropDown:Show()
 				end
 			else
@@ -2787,11 +3433,7 @@ function DMV_CreateInterfaceOptionsPanel()
 	coordCheck:SetScript("OnClick", function(self)
 		local control = self or this or coordCheck
 		if DMV_Settings then DMV_Settings.showCoords = control:GetChecked() and true or false end
-		if not DMV_CoordsDisabled then
-			local show = DMV_Settings and DMV_Settings.showCoords ~= false
-			if DMV_CoordsFrame		 then DMV_CoordsFrame[show and "Show" or "Hide"](DMV_CoordsFrame) end
-			if DMV_PlayerCoordsFrame then DMV_PlayerCoordsFrame[show and "Show" or "Hide"](DMV_PlayerCoordsFrame) end
-		end
+		DMV_UpdateCoordsVisibility()
 	end)
 
 	local cmdHeader = panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -2832,10 +3474,7 @@ function DMV_CreateInterfaceOptionsPanel()
 		if DMV_Settings then DMV_Settings.showCoords = true end
 		panel.refresh()
 		if DMV_UpdatePartyBlips then DMV_UpdatePartyBlips() end
-		if not DMV_CoordsDisabled then
-			if DMV_CoordsFrame		 then DMV_CoordsFrame:Show() end
-			if DMV_PlayerCoordsFrame then DMV_PlayerCoordsFrame:Show() end
-		end
+		DMV_UpdateCoordsVisibility()
 	end
 
 	InterfaceOptions_AddCategory(panel)
@@ -2887,16 +3526,12 @@ if WorldMapZoomOutButton then
 		local onRealMap = DMV_IsOnRealWorldMap()
 		-- If we are browsing or previewing a map...
 		if DMV_InstanceBrowseMode or DMV_PreviewMode or (DMV_CurrentDungeon and not onRealMap) then
-			-- Find the frame carrying your right-click script (clickFrame or WorldMapButton)
-			local clickFrame = DMV_ClickFrame or WorldMapButton or WorldMapDetailTile1
-			
-			if clickFrame then
-				local rightClickScript = clickFrame:GetScript("OnMouseDown") or clickFrame:GetScript("OnClick")
-				if rightClickScript then
-					-- Execute your exact right-click logic with "RightButton"
-					rightClickScript(clickFrame, "RightButton")
-					return
-				end
+			-- Run the overlay's right-click handler (DMV_ClickFrame exists from
+			-- the first map open on).
+			local rightClickScript = DMV_ClickFrame and DMV_ClickFrame:GetScript("OnMouseDown")
+			if rightClickScript then
+				rightClickScript(DMV_ClickFrame, "RightButton")
+				return
 			end
 		end
 
@@ -2943,11 +3578,7 @@ DMV_ZoomOutStateFrame:SetScript("OnEvent", function()
 end)
 
 -- Hook WorldMapFrame OnShow to guarantee button state on open
-if WorldMapFrame then
-	WorldMapFrame:HookScript("OnShow", function()
-		DMV_UpdateZoomOutButton()
-	end)
-end
+DMV_HookScriptPost(WorldMapFrame, "OnShow", DMV_UpdateZoomOutButton)
 
 -- Also hook default update function as a secondary check
 local _origWorldMapFrame_Update = WorldMapFrame_Update
@@ -2970,15 +3601,11 @@ SlashCmdList["DMV"] = function(msg)
 		if instanceMapID and DMV_GlobalSettings.bossPinOverrides then
 			DMV_GlobalSettings.bossPinOverrides[instanceMapID] = nil
 		end
-		if DMV_Visible then
-			DMV_HideBossPins(); DMV_ShowBossPins()
-		end
+		if DMV_Visible then DMV_ShowBossPins() end
 		print(L["Calib Reset2"])
 	elseif msg == "calib" then
 		DMV_CalibMode = not DMV_CalibMode
-		if DMV_Visible then
-			DMV_HideBossPins(); DMV_ShowBossPins()
-		end
+		if DMV_Visible then DMV_ShowBossPins() end
 		if DMV_CalibMode then
 			print(L["Calib On"])
 		else
@@ -2987,13 +3614,13 @@ SlashCmdList["DMV"] = function(msg)
 	elseif msg == "arrow" then
 		local posY, posX, posZ = UnitPosition("player")
 		local _, _, _, _, _, _, _, instanceMapID = GetInstanceInfo()
-		print(string.format("  posZ=%.4f", posZ or 0))
 		local floorRects = DMV_FloorMapRects and DMV_FloorMapRects[instanceMapID]
 		local rect = floorRects and floorRects[DMV_CurrentFloor]
 		if rect and not rect.locLeft then rect = nil end
 		print(string.format("|cff00ff00DMV Arrow|r: posY=%.4f posX=%.4f instanceMapID=%s floor=%s",
 			posY or 0, posX or 0, tostring(instanceMapID), tostring(DMV_CurrentFloor)))
-		if rect then
+		print(string.format("  posZ=%.4f", posZ or 0))
+		if rect and posY and posX then
 			local width  = rect.locLeft - rect.locRight
 			local height = rect.locTop  - rect.locBottom
 			local mapX = (rect.locLeft - posY) / width  * 100
@@ -3006,7 +3633,7 @@ SlashCmdList["DMV"] = function(msg)
 			print("  no rect for instanceMapID=" .. tostring(instanceMapID) .. " floor=" .. tostring(DMV_CurrentFloor))
 		end
 		print(string.format("  Visible=%s Ticker=%s Arrow=%s",
-			tostring(DMV_Visible), tostring(DMV_PlayerArrowTicker ~= nil),
+			tostring(DMV_Visible), tostring(DMV_RefreshTicker ~= nil and DMV_RefreshTicker:IsShown() ~= nil),
 			DMV_PlayerArrow and (DMV_PlayerArrow:IsShown() and "shown" or "hidden") or "nil"))
 	elseif msg == "debug" then
 		local canvas = GetMapCanvas()
@@ -3026,7 +3653,7 @@ SlashCmdList["DMV"] = function(msg)
 			print("  Texture1 loaded: " .. tostring(DMV_Textures[1]:GetTexture()))
 		end
 		print("  Arrow: " .. (DMV_PlayerArrow and (DMV_PlayerArrow:IsShown() and "visible" or "hidden") or "not created"))
-		print("  ArrowTicker: " .. tostring(DMV_PlayerArrowTicker ~= nil))
+		print("  ArrowTicker: " .. tostring(DMV_RefreshTicker ~= nil and DMV_RefreshTicker:IsShown() ~= nil))
 	else
 		-- Bare /dmv: print available commands.
 		print("|cff00ff00DungeonMapsVanilla|r")

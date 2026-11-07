@@ -38,7 +38,6 @@ local function DMV_ApplyWindowFallback()
 	-- Replace ToggleWorldMap with a simple Show/Hide so the map no longer
 	-- triggers the full-screen panel blackout.
 	if not DMV_WindowFallbackInstalled then
-		local origToggle = ToggleWorldMap
 		function ToggleWorldMap()
 			if WorldMapFrame:IsShown() then
 				WorldMapFrame:Hide()
@@ -50,33 +49,31 @@ local function DMV_ApplyWindowFallback()
 
 	-- Re-apply scale and layout on every map open so it survives other
 	-- addons resetting the frame (mirrors ShaguTweaks's OnShow hook).
-	-- Centering is deferred one frame via OnUpdate so it runs after
-	-- ShowUIPanel (called by the stock OnShow) has finished repositioning.
+	-- Centering is deferred one frame so it runs after the stock OnShow has
+	-- finished repositioning.
 	if not DMV_WindowFallbackInstalled then
-		local oldOnShow = WorldMapFrame:GetScript("OnShow")
-		WorldMapFrame:SetScript("OnShow", function()
-			if oldOnShow then oldOnShow() end
+		local centerDelay = CreateFrame("Frame")
+		centerDelay:Hide()
+		centerDelay:SetScript("OnUpdate", function()
+			centerDelay:Hide()
+			WorldMapFrame:ClearAllPoints()
+			WorldMapFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+		end)
+
+		DMV_HookScriptPost(WorldMapFrame, "OnShow", function()
 			WorldMapFrame:EnableKeyboard(false)
 			WorldMapFrame:SetScale(DMV_WINDOW_SCALE)
-			WorldMapFrame:SetScript("OnUpdate", function()
-				WorldMapFrame:SetScript("OnUpdate", nil)
-				WorldMapFrame:ClearAllPoints()
-				WorldMapFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
-			end)
+			centerDelay:Show()
 		end)
 
 		WorldMapFrame:SetMovable(true)
 		WorldMapFrame:EnableMouse(true)
 
-		local oldOnMouseDown = WorldMapFrame:GetScript("OnMouseDown")
-		WorldMapFrame:SetScript("OnMouseDown", function()
+		WorldMapFrame:HookScript("OnMouseDown", function()
 			WorldMapFrame:StartMoving()
-			if oldOnMouseDown then oldOnMouseDown() end
 		end)
-		local oldOnMouseUp = WorldMapFrame:GetScript("OnMouseUp")
-		WorldMapFrame:SetScript("OnMouseUp", function()
+		WorldMapFrame:HookScript("OnMouseUp", function()
 			WorldMapFrame:StopMovingOrSizing()
-			if oldOnMouseUp then oldOnMouseUp() end
 		end)
 	end
 
@@ -128,31 +125,36 @@ local function DMV_ApplyMagnifyCompat()
 
 	-- 1. Arrow
 	-- Use Magnify's WorldMapArrow texture on DMV_PlayerArrow.
-	-- SetRotation (ClassicAPI backport): positive = counter-clockwise.
-	-- GetPlayerFacing(): positive = clockwise.
-	-- Both are clockwise in WoW's convention, so pass facing directly.
+	-- GetPlayerFacing() and texture:SetRotation() both measure angles
+	-- counter-clockwise, so facing is passed directly.
 	-- Size follows Magnify's arrow_scale, inverse-scaled with map zoom.
 
 	local magnifyTexture = "Interface\\AddOns\\Magnify\\assets\\WorldMapArrow"
 	local arrowTextureSet = false
 
 	local origUpdateArrow = DMV_UpdatePlayerArrow
+	local arrowSize = nil
 	DMV_UpdatePlayerArrow = function()
 		origUpdateArrow()
 
-		if not DMV_PlayerArrow or not DMV_PlayerArrow:IsShown() then return end
+		local arrow = DMV_PlayerArrow
+		if not arrow or not arrow:IsShown() then return end
 
-		if not arrowTextureSet and DMV_PlayerArrow.tex then
-			DMV_PlayerArrow.tex:SetTexture(magnifyTexture)
+		if not arrowTextureSet and arrow.tex then
+			arrow.tex:SetTexture(magnifyTexture)
 			arrowTextureSet = true
+			if arrow.tex.SetRotation then
+				arrow.facing = (GetPlayerFacing and GetPlayerFacing()) or 0
+				arrow.tex:SetRotation(arrow.facing)
+			end
 		end
 
 		local mapScale = (WorldMapDetailFrame and WorldMapDetailFrame:GetScale()) or 1
-		local baseSize = 24 * ((Magnify_Settings and Magnify_Settings["arrow_scale"]) or 1)
-		DMV_PlayerArrow:SetSize(baseSize / mapScale, baseSize / mapScale)
-
-		local facing = (GetPlayerFacing and GetPlayerFacing()) or 0
-		DMV_PlayerArrow.tex:SetRotation(facing)
+		local size = 24 * ((Magnify_Settings and Magnify_Settings["arrow_scale"]) or 1) / mapScale
+		if size ~= arrowSize then
+			arrow:SetSize(size, size)
+			arrowSize = size
+		end
 	end
 
 	-- 2. Scroll wheel
@@ -170,6 +172,7 @@ local function DMV_ApplyMagnifyCompat()
 	local function DMV_InstallWheelHandler()
 		if not DMV_ClickFrame then return end
 		DMV_ClickFrame:SetScript("OnMouseWheel", function(self, delta)
+			delta = delta or arg1
 			local sf = WorldMapFrameScrollFrame
 			if not sf or not WorldMapDetailFrame then return end
 
@@ -210,6 +213,14 @@ local function DMV_ApplyMagnifyCompat()
 		end)
 	end
 
+	-- The arrow's image is drawn by DMV_OverlayDraw, not by the arrow frame,
+	-- so the flash fades the image (arrow.tex) directly. The on/off state is
+	-- kept here rather than read back from the texture.
+	local function SetArrowImageAlpha(a)
+		local tex = DMV_PlayerArrow and DMV_PlayerArrow.tex
+		if tex then tex:SetAlpha(a) end
+	end
+
 	local DMV_FlashTicker = CreateFrame("Frame")
 	DMV_FlashTicker:Hide()
 	DMV_FlashTicker:SetScript("OnUpdate", function(self, elapsed)
@@ -222,12 +233,12 @@ local function DMV_ApplyMagnifyCompat()
 			self.Elapsed = 0
 			if self.Flashes < MAGNIFY_PLAYER_FLASH_COUNT then
 				self.Flashes = self.Flashes + 1
-				if DMV_PlayerArrow then
-					DMV_PlayerArrow:SetAlpha(DMV_PlayerArrow:GetAlpha() == 1 and 0 or 1)
-				end
+				self.dimmed = not self.dimmed
+				SetArrowImageAlpha(self.dimmed and 0 or 1)
 			else
 				self.Flashes = 0
-				if DMV_PlayerArrow then DMV_PlayerArrow:SetAlpha(1) end
+				self.dimmed = false
+				SetArrowImageAlpha(1)
 				self:Hide()
 			end
 		end
@@ -238,25 +249,30 @@ local function DMV_ApplyMagnifyCompat()
 		if Magnify_Settings and Magnify_Settings["arrow_flash"] then
 			DMV_FlashTicker.Elapsed = 0
 			DMV_FlashTicker.Flashes = 0
+			DMV_FlashTicker.dimmed = false
+			SetArrowImageAlpha(1)
 			DMV_FlashTicker:Show()
 		else
-			DMV_PlayerArrow:SetAlpha(1)
+			DMV_FlashTicker:Hide()
+			DMV_FlashTicker.dimmed = false
+			SetArrowImageAlpha(1)
 		end
 	end
 
 	local origShow = DMV_ShowFrames
 	DMV_ShowFrames = function(...)
+		local wasShown = DMV_ClickFrame and DMV_ClickFrame:IsShown()
 		origShow(...)
 		DMV_InstallWheelHandler()
-		DMV_FlashPlayerArrow()
+		if not wasShown then DMV_FlashPlayerArrow() end
 		if WorldMapZoomOutButton and not DMV_IsOnRealWorldMap() then
 			WorldMapZoomOutButton:Enable()
 		end
 	end
 
 	-- 3. Strata: raise DMV controls above Magnify's scroll frame
-	-- Called once now (in case we are already in a dungeon) and again inside
-	-- DMV_ShowFrames via the hook above on subsequent opens.
+	-- Called once now (in case we are already in a dungeon) and again on
+	-- every WORLD_MAP_UPDATE while the map is open.
 	local function RaiseControls()
 		local targets = {
 			DMV_ClickFrame,
@@ -264,13 +280,13 @@ local function DMV_ApplyMagnifyCompat()
 			DMV_LevelUpButton,
 			DMV_LevelDownButton,
 			DMV_BossPinDropDown,
-			DMV_PlayerArrow,
 			getglobal("DMV_LevelDropDownButton"),
 			getglobal("DMV_BossPinDropDownButton"),
 		}
 		for _, w in ipairs(targets) do
-			if w then w:SetFrameStrata("FULLSCREEN_DIALOG") end
+			if w and w:GetFrameStrata() ~= "FULLSCREEN_DIALOG" then w:SetFrameStrata("FULLSCREEN_DIALOG") end
 		end
+		if DMV_ApplyOverlayLevels then DMV_ApplyOverlayLevels() end
 	end
 	RaiseControls()
 	
@@ -291,11 +307,14 @@ local function DMV_ApplyMagnifyCompat()
 		DMV_AreaFrameCompatInstalled = true
 		local savedOnUpdate = WorldMapFrameAreaFrame:GetScript("OnUpdate")
 
+		local areaHiddenByDMV = false
+
 		local origShowArea = DMV_ShowFrames
 		DMV_ShowFrames = function(...)
 			origShowArea(...)
 			if WorldMapFrameAreaFrame then
 				WorldMapFrameAreaFrame:SetScript("OnUpdate", nil)
+				if WorldMapFrameAreaFrame:IsShown() then areaHiddenByDMV = true end
 				WorldMapFrameAreaFrame:Hide()
 			end
 		end
@@ -305,27 +324,131 @@ local function DMV_ApplyMagnifyCompat()
 			origHideArea(...)
 			if WorldMapFrameAreaFrame then
 				WorldMapFrameAreaFrame:SetScript("OnUpdate", savedOnUpdate)
+				if areaHiddenByDMV then
+					areaHiddenByDMV = false
+					WorldMapFrameAreaFrame:Show()
+				end
 			end
 		end
 	end
 	-- 5. Party/raid blips: inverse-scale with map zoom
 	-- Blips are children of DMV_Container which lives inside WorldMapDetailFrame,
-	-- so they inherit its scale.  Resize them each update to counteract that.
+	-- so they inherit its scale. They are resized (all of them, shown or not)
+	-- only when the zoom changes or new blips have been created.
 	local origUpdateBlips = DMV_UpdatePartyBlips
+	local blipScale, blipCount = nil, 0
 	DMV_UpdatePartyBlips = function(...)
 		origUpdateBlips(...)
 		local mapScale = (WorldMapDetailFrame and WorldMapDetailFrame:GetScale()) or 1
-		local scaledSize = BLIP_SIZE / mapScale
-		for _, blip in pairs(DMV_PartyBlips) do
-			if blip and blip:IsShown() then
-				blip:SetSize(scaledSize, scaledSize)
-			end
+		local n = table.getn(DMV_PartyBlips)
+		if mapScale ~= blipScale or n ~= blipCount then
+			local scaledSize = DMV_BLIP_SIZE / mapScale
+			for i = 1, n do DMV_PartyBlips[i]:SetSize(scaledSize, scaledSize) end
+			blipScale, blipCount = mapScale, n
 		end
+	end
+
+	-- 6. Mouse clipping while zoomed
+	-- Zooming scales WorldMapDetailFrame past the edges of Magnify's scroll
+	-- frame. The overflow is not drawn but still receives the mouse, so the
+	-- full-size DMV_ClickFrame (FULLSCREEN_DIALOG) would cover the dropdowns
+	-- and buttons around the map. DMV_ClickFrame is therefore kept to the
+	-- visible part of the overlay, and markers, blips and the player arrow
+	-- take mouse input only while they are inside the visible area.
+	local sf = WorldMapFrameScrollFrame
+	if not sf then return end
+
+	local function ScreenRect(f)
+		local l, b, r, t = f:GetLeft(), f:GetBottom(), f:GetRight(), f:GetTop()
+		if not (l and b and r and t) then return nil end
+		local s = f:GetEffectiveScale()
+		return l * s, b * s, r * s, t * s
+	end
+
+	local function ClipClickFrame(vl, vb, vr, vt)
+		local c = DMV_Container
+		local cl, cb, cr, ct = ScreenRect(c)
+		if not cl then return false end
+		local s = c:GetEffectiveScale()
+		local l, r = math.max(cl, vl), math.min(cr, vr)
+		local b, t = math.max(cb, vb), math.min(ct, vt)
+		DMV_ClickFrame:ClearAllPoints()
+		DMV_ClickFrame:SetPoint("TOPLEFT", c, "TOPLEFT", (l - cl) / s, (t - ct) / s)
+		DMV_ClickFrame:SetWidth(math.max(0, r - l) / s)
+		DMV_ClickFrame:SetHeight(math.max(0, t - b) / s)
+		return true
+	end
+
+	-- vl == nil (not zoomed in): everything is in view, so re-enable the mouse
+	-- on hidden frames too, in case they were disabled while zoomed in.
+	local function ClipMouse(f, vl, vb, vr, vt)
+		if not f then return end
+		if not vl then f:EnableMouse(true) return end
+		if not f:IsShown() then return end
+		local l, b, r, t = ScreenRect(f)
+		if not l then return end
+		f:EnableMouse(l < vr and r > vl and b < vt and t > vb)
+	end
+
+	local function ClipMarkers(vl, vb, vr, vt)
+		for _, pin in ipairs(DMV_BossPinList) do ClipMouse(pin, vl, vb, vr, vt) end
+		for _, blip in pairs(DMV_PartyBlips) do ClipMouse(blip, vl, vb, vr, vt) end
+		ClipMouse(DMV_PlayerArrow, vl, vb, vr, vt)
+	end
+
+	-- The click frame is re-clipped only when zoom or scroll changes. Markers
+	-- move on their own, so they are checked every 0.1 s while zoomed in, and
+	-- once more when not zoomed in so all of them take the mouse again.
+	local clipFrame = CreateFrame("Frame", nil, WorldMapFrame)
+	clipFrame:Hide()
+	local lastH, lastV, lastZoom, lastScale
+	local markerElapsed, wasZoomed = 0, false
+	clipFrame:SetScript("OnUpdate", function(self, elapsed)
+		elapsed = tonumber(elapsed) or tonumber(arg1) or 0
+		if not DMV_ClickFrame or not DMV_ClickFrame:IsShown() or not DMV_Container then return end
+
+		local h, v = sf:GetHorizontalScroll(), sf:GetVerticalScroll()
+		local zoom, scale = WorldMapDetailFrame:GetScale(), DMV_Container:GetScale()
+		local viewChanged = h ~= lastH or v ~= lastV or zoom ~= lastZoom or scale ~= lastScale
+		local zoomed = zoom > (MAGNIFY_MIN_ZOOM or 1.0)
+		markerElapsed = markerElapsed + elapsed
+		local checkMarkers = (zoomed and markerElapsed >= 0.1) or (wasZoomed and not zoomed)
+		if not viewChanged and not checkMarkers then return end
+
+		local vl, vb, vr, vt = ScreenRect(sf)
+		if not vl then return end
+		if viewChanged and ClipClickFrame(vl, vb, vr, vt) then
+			lastH, lastV, lastZoom, lastScale = h, v, zoom, scale
+		end
+		if checkMarkers then
+			markerElapsed = 0
+			if zoomed then ClipMarkers(vl, vb, vr, vt) else ClipMarkers() end
+			wasZoomed = zoomed
+		end
+	end)
+
+	local origShowClip = DMV_ShowFrames
+	DMV_ShowFrames = function(...)
+		origShowClip(...)
+		lastH = nil			-- force a re-clip on the next frame
+		markerElapsed = 0.1
+		wasZoomed = true	-- one marker pass even when not zoomed
+		clipFrame:Show()
+	end
+
+	local origHideClip = DMV_HideFrames
+	DMV_HideFrames = function(...)
+		local result = origHideClip(...)
+		clipFrame:Hide()
+		return result
 	end
 end
 
--- ShaguTweaks (no Magnify)
-if not IsAddOnLoaded("Magnify") then
+-- No Magnify (ShaguTweaks, pfUI or the stock map)
+-- Runs on the first PLAYER_ENTERING_WORLD, when every addon is loaded, so
+-- ShaguTweaks's window mode (and pfUI's map module) can be detected.
+local function DMV_ApplyNoMagnifyCompat()
+	if IsAddOnLoaded("Magnify") then return end
 	DMV_ApplyWindowFallback()
 
 	local function DMV_DisableWheelResize()
@@ -343,17 +466,81 @@ if not IsAddOnLoaded("Magnify") then
 end
 
 -- Coordinates
--- When Magnify is loaded, DMV feeds its existing MagnifyCoordsFrame (cursor)
--- and MagnifyPlayerFrame (player) with dungeon aware values, since
--- GetPlayerMapPosition returns 0,0 inside instances.
--- When Magnify is NOT loaded, DMV creates its own identical coordinate frames
--- anchored and styled the same way, and disables them outside dungeon view.
--- Disable DMV's coord frames when Magnify is loaded (Magnify provides its own).
+-- DMV shows its own cursor and player coordinate frames (styled like
+-- Magnify's) while the dungeon map is displayed, following DMV's "Show
+-- Coordinates" option.
+-- Magnify's coordinate frames cannot be shared: inside instances
+-- GetPlayerMapPosition returns 0,0, and Magnify's updaters (one per layout
+-- pass) write "Player: N/A" every frame, overwriting anything DMV writes.
+-- While the dungeon map is shown, Magnify's two frames are therefore hidden
+-- and DMV's are placed exactly where Magnify's are (anchored to them, so
+-- they follow Magnify's own repositioning). Magnify's frames are shown again
+-- when the dungeon map closes, only if DMV hid them.
 local function DMV_ApplyCoordCompat()
 	if not IsAddOnLoaded("Magnify") then return end
-	DMV_CoordsDisabled = true
-	if DMV_CoordsFrame		 then DMV_CoordsFrame:Hide()	   end
-	if DMV_PlayerCoordsFrame then DMV_PlayerCoordsFrame:Hide() end
+
+	local hiddenByDMV = {}
+
+	local function Restore()
+		for f in pairs(hiddenByDMV) do
+			hiddenByDMV[f] = nil
+			f:Show()
+		end
+	end
+
+	-- Either frame may be missing (older Magnify builds).
+	local function HideMagnify(f)
+		if f and f:IsShown() then
+			f:Hide()
+			hiddenByDMV[f] = true
+		end
+	end
+
+	-- Anchor a DMV frame onto Magnify's matching frame. A Magnify frame
+	-- without a position (unknown Magnify build) falls back to the corner of
+	-- Magnify's scroll frame that Magnify uses.
+	local function Dock(dmvFrame, magFrame, corner, x)
+		if not dmvFrame then return end
+		if magFrame and magFrame:GetPoint() then
+			dmvFrame:ClearAllPoints()
+			dmvFrame:SetAllPoints(magFrame)
+		elseif WorldMapFrameScrollFrame then
+			dmvFrame:ClearAllPoints()
+			dmvFrame:SetPoint(corner, WorldMapFrameScrollFrame, corner, x, -24)
+		end
+	end
+
+	local function Sync()
+		-- DMV_ClickFrame is shown exactly while the dungeon map is displayed.
+		if not (DMV_ClickFrame and DMV_ClickFrame:IsShown()) then Restore() return end
+		local magCoords, magPlayer = getglobal("MagnifyCoordsFrame"), getglobal("MagnifyPlayerFrame")
+		HideMagnify(magCoords)
+		HideMagnify(magPlayer)
+		Dock(DMV_CoordsFrame, magCoords, "BOTTOMLEFT", 10)
+		Dock(DMV_PlayerCoordsFrame, magPlayer, "BOTTOMRIGHT", -10)
+	end
+
+	-- Options panel toggles go through DMV_UpdateCoordsVisibility; showing
+	-- the map goes through DMV_ShowFrames (wrapped last, so the docking runs
+	-- after every other compat layer, pfUI's coordinate offset included).
+	local origUpdate = DMV_UpdateCoordsVisibility
+	DMV_UpdateCoordsVisibility = function(...)
+		origUpdate(...)
+		Sync()
+	end
+
+	local origShow = DMV_ShowFrames
+	DMV_ShowFrames = function(...)
+		origShow(...)
+		Sync()
+	end
+
+	local origHide = DMV_HideFrames
+	DMV_HideFrames = function(...)
+		local result = origHide(...)
+		Restore()
+		return result
+	end
 end
 
 -- ModernMapMarkers
@@ -380,18 +567,27 @@ end
 local function DMV_ApplyMMMCompat()
 	if not IsAddOnLoaded("ModernMapMarkers") then return end
 
+	local filterHidden, findHidden = false, false
+
 	local origShow = DMV_ShowFrames
 	DMV_ShowFrames = function(...)
 		origShow(...)
-		if MMMFilterDropdown then MMMFilterDropdown:Hide() end
-		if MMMFindDropdown   then MMMFindDropdown:Hide()   end
+		if MMMFilterDropdown and MMMFilterDropdown:IsShown() then
+			filterHidden = true
+			MMMFilterDropdown:Hide()
+		end
+		if MMMFindDropdown and MMMFindDropdown:IsShown() then
+			findHidden = true
+			MMMFindDropdown:Hide()
+		end
 	end
 
 	local origHide = DMV_HideFrames
 	DMV_HideFrames = function(...)
 		origHide(...)
-		if MMMFilterDropdown then MMMFilterDropdown:Show() end
-		if MMMFindDropdown   then MMMFindDropdown:Show()   end
+		if filterHidden and MMMFilterDropdown then MMMFilterDropdown:Show() end
+		if findHidden and MMMFindDropdown then MMMFindDropdown:Show() end
+		filterHidden, findHidden = false, false
 		DMV_RepositionMMMDropdowns()
 	end
 
@@ -581,17 +777,30 @@ end
 local function DMV_ApplyAtlasAutoSelectFix()
 	if not DMV_OpenAtlasBoss then return end
 	local orig = DMV_OpenAtlasBoss
+	local restorePending = false
+	local hooked = false
+
+	local function Restore()
+		if restorePending then
+			restorePending = false
+			if AtlasOptions then AtlasOptions.AtlasAutoSelect = true end
+		end
+	end
+
 	DMV_OpenAtlasBoss = function(atlasMapKey)
 		if not AtlasOptions then return orig(atlasMapKey) end
-		local savedAutoSelect = AtlasOptions.AtlasAutoSelect
-		if savedAutoSelect then
+		if AtlasOptions.AtlasAutoSelect then
 			AtlasOptions.AtlasAutoSelect = false
+			restorePending = true
 		end
 		local result = orig(atlasMapKey)
-		if savedAutoSelect and AtlasFrame then
-			AtlasFrame:HookScript("OnHide", function()
-				AtlasOptions.AtlasAutoSelect = true
-			end)
+		if restorePending then
+			if AtlasFrame and not hooked then
+				hooked = true
+				AtlasFrame:HookScript("OnHide", Restore)
+			end
+			-- Atlas was not opened (no matching map): restore right away.
+			if not (AtlasFrame and AtlasFrame:IsShown()) then Restore() end
 		end
 		return result
 	end
@@ -603,16 +812,34 @@ end
 -- WORLD_MAP_UPDATE handler only hides pins for continent view, not for
 -- instance maps it can't resolve. The pins bleed into the dungeon overlay.
 -- Fix: hide all pfMap worldmap pins on DMV open, restore on DMV close.
+-- pfQuest's quest display dropdown ("All Quests", pfQuestMapDropdown) is a
+-- child of WorldMapButton, so DMV's overlay normally covers it, but Magnify
+-- moves it onto WorldMapFrame at FULLSCREEN_DIALOG, above the dungeon map.
+-- It only applies to the world map, so it is hidden the same way.
 local function DMV_ApplypfQuestCompat()
 	if not pfMap or not pfMap.pins then return end
+
+	-- Only what DMV hid is restored (DMV_HideFrames also runs on every
+	-- loading screen and map change), so a route layer the player turned off
+	-- in pfQuest stays off, and a dropdown pfQuest did not create or show
+	-- stays hidden.
+	local pinsHidden, routeHidden, dropdownHidden = false, false, false
 
 	local origShow = DMV_ShowFrames
 	DMV_ShowFrames = function(...)
 		for i = 1, table.getn(pfMap.pins) do
 			if pfMap.pins[i] then pfMap.pins[i]:Hide() end
 		end
-		if pfQuest and pfQuest.route and pfQuest.route.drawlayer then
-			pfQuest.route.drawlayer:Hide()
+		pinsHidden = true
+		local layer = pfQuest and pfQuest.route and pfQuest.route.drawlayer
+		if layer and layer:IsShown() then
+			layer:Hide()
+			routeHidden = true
+		end
+		local dropdown = getglobal("pfQuestMapDropdown")
+		if dropdown and dropdown:IsShown() then
+			dropdown:Hide()
+			dropdownHidden = true
 		end
 		return origShow(...)
 	end
@@ -622,10 +849,21 @@ local function DMV_ApplypfQuestCompat()
 		local result = origHide(...)
 		-- Re-show the route drawlayer so pfQuest's own WORLD_MAP_UPDATE handler
 		-- can take over. Without this, pfQuest never sees it as needing a restore.
-		if pfQuest and pfQuest.route and pfQuest.route.drawlayer then
-			pfQuest.route.drawlayer:Show()
+		if routeHidden then
+			routeHidden = false
+			local layer = pfQuest and pfQuest.route and pfQuest.route.drawlayer
+			if layer then layer:Show() end
 		end
-		if pfMap.UpdateNodes then pfMap:UpdateNodes() end
+		-- pfQuest's OnShow re-reads its tracking setting into the dropdown.
+		if dropdownHidden then
+			dropdownHidden = false
+			local dropdown = getglobal("pfQuestMapDropdown")
+			if dropdown then dropdown:Show() end
+		end
+		if pinsHidden then
+			pinsHidden = false
+			if pfMap.UpdateNodes then pfMap:UpdateNodes() end
+		end
 		return result
 	end
 end
@@ -634,29 +872,44 @@ end
 -- Call Questie:Toggle() to disable Questie while the dungeon overlay is shown
 -- and re-enable it when the overlay is hidden. Toggle() clears all notes and
 -- sets IsQuestieActive = false, which stops DRAW_NOTES from placing any icons.
--- We only toggle off if Questie is currently active to avoid flipping its state
--- when the player had it disabled themselves.
+-- Questie is only switched back on if DMV switched it off, so a player who
+-- disabled Questie keeps it disabled (DMV_HideFrames also runs on every
+-- loading screen).
 local function DMV_ApplyQuestieCompat()
 	if not IsAddOnLoaded("!Questie") then return end
 
+	local disabledByDMV = false
+
 	local origShow = DMV_ShowFrames
 	DMV_ShowFrames = function(...)
-		if IsQuestieActive then Questie:Toggle() end
+		if IsQuestieActive then
+			Questie:Toggle()
+			disabledByDMV = true
+		end
 		return origShow(...)
 	end
 
 	local origHide = DMV_HideFrames
 	DMV_HideFrames = function(...)
 		local result = origHide(...)
-		if not IsQuestieActive then Questie:Toggle() end
+		if disabledByDMV then
+			disabledByDMV = false
+			if not IsQuestieActive then Questie:Toggle() end
+		end
 		return result
 	end
 end
 
+-- Apply every compat layer once, on the first PLAYER_ENTERING_WORLD (all
+-- addons and saved variables are loaded by then). PLAYER_ENTERING_WORLD fires
+-- on every loading screen, and these functions wrap DMV functions and create
+-- frames, so running them again would stack duplicate wrappers.
 local compatFrame = CreateFrame("Frame")
 compatFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 compatFrame:SetScript("OnEvent", function()
+	compatFrame:UnregisterEvent("PLAYER_ENTERING_WORLD")
 	DMV_WINDOW_SCALE = DMV_GetWindowScale()
+	DMV_ApplyNoMagnifyCompat()
 	DMV_ApplyMagnifyCompat()
 	DMV_ApplyAtlasAutoSelectFix()
 	DMV_ScheduleAtlasPriming()
