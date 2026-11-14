@@ -123,6 +123,17 @@ local function DMV_ApplyMagnifyCompat()
 		DMV_ApplyWindowFallback()
 	end
 
+	-- 0. ShaguTweaks: Magnify keeps re-anchoring its map area to the top of
+	-- WorldMapFrame, which leaves the map shifted against the window artwork.
+	-- Pin it to the artwork (WorldMapPositioningGuide) whenever the map opens.
+	if IsAddOnLoaded("ShaguTweaks") and WorldMapPositioningGuide and not (pfUI and pfUI.map) then
+		DMV_HookScriptPost(WorldMapFrame, "OnShow", function()
+			if WORLDMAP_WINDOWED == 1 then return end
+			WorldMapFrameScrollFrame:ClearAllPoints()
+			WorldMapFrameScrollFrame:SetPoint("TOP", WorldMapPositioningGuide, "TOP", 0, -70)
+		end)
+	end
+
 	-- 1. Arrow
 	-- Use Magnify's WorldMapArrow texture on DMV_PlayerArrow.
 	-- GetPlayerFacing() and texture:SetRotation() both measure angles
@@ -543,6 +554,30 @@ local function DMV_ApplyCoordCompat()
 	end
 end
 
+-- ShaguTweaks coordinates
+-- Hidden while DMV's dungeon map (with its own coordinates) is shown.
+-- Magnify already removes them, so nothing is needed alongside it.
+local function DMV_ApplyShaguCoordCompat()
+	if IsAddOnLoaded("Magnify") or not IsAddOnLoaded("ShaguTweaks") then return end
+
+	local function SetShown(show)
+		local coords, player = WorldMapButton.coords, WorldMapButton.player
+		if not coords then return end
+		if show then coords:Show() player:Show() else coords:Hide() player:Hide() end
+	end
+
+	local origShow, origHide = DMV_ShowFrames, DMV_HideFrames
+	DMV_ShowFrames = function(...)
+		origShow(...)
+		SetShown(false)
+	end
+	DMV_HideFrames = function(...)
+		local result = origHide(...)
+		SetShown(true)
+		return result
+	end
+end
+
 -- ModernMapMarkers
 -- MMM's filter and find dropdowns are only relevant on the world map.
 -- Hide them while the dungeon map is visible and restore them on close.
@@ -557,7 +592,14 @@ local DMV_MMM_FILTER_Y = -56
 local function DMV_RepositionMMMDropdowns()
 	if not MMMFilterDropdown then return end
 	MMMFilterDropdown:ClearAllPoints()
-	MMMFilterDropdown:SetPoint("TOPRIGHT", WorldMapFrame, "TOPRIGHT", DMV_MMM_FILTER_X, DMV_MMM_FILTER_Y)
+	-- Keep MMM's own pfQuest anchoring: below Level Range, else below All Quests.
+	local pfDrop = getglobal("pfQuestMapDropdown")
+	local pfAnchor = pfDrop and (getglobal("pfQuestMapLevelDropdown") or pfDrop)
+	if pfAnchor then
+		MMMFilterDropdown:SetPoint("TOPRIGHT", pfAnchor, "BOTTOMRIGHT", 0, 0)
+	else
+		MMMFilterDropdown:SetPoint("TOPRIGHT", WorldMapFrame, "TOPRIGHT", DMV_MMM_FILTER_X, DMV_MMM_FILTER_Y)
+	end
 	if MMMFindDropdown then
 		MMMFindDropdown:ClearAllPoints()
 		MMMFindDropdown:SetPoint("TOPRIGHT", MMMFilterDropdown, "BOTTOMRIGHT", 0, 0)
@@ -815,7 +857,8 @@ end
 -- pfQuest's quest display dropdown ("All Quests", pfQuestMapDropdown) is a
 -- child of WorldMapButton, so DMV's overlay normally covers it, but Magnify
 -- moves it onto WorldMapFrame at FULLSCREEN_DIALOG, above the dungeon map.
--- It only applies to the world map, so it is hidden the same way.
+-- It only applies to the world map, so it is hidden the same way, as is the
+-- "Level Range" dropdown (pfQuestMapLevelDropdown), a child of WorldMapFrame.
 local function DMV_ApplypfQuestCompat()
 	if not pfMap or not pfMap.pins then return end
 
@@ -823,7 +866,9 @@ local function DMV_ApplypfQuestCompat()
 	-- loading screen and map change), so a route layer the player turned off
 	-- in pfQuest stays off, and a dropdown pfQuest did not create or show
 	-- stays hidden.
-	local pinsHidden, routeHidden, dropdownHidden = false, false, false
+	local pinsHidden, routeHidden = false, false
+	local dropdowns = { "pfQuestMapDropdown", "pfQuestMapLevelDropdown" }
+	local dropdownHidden = {}
 
 	local origShow = DMV_ShowFrames
 	DMV_ShowFrames = function(...)
@@ -836,10 +881,12 @@ local function DMV_ApplypfQuestCompat()
 			layer:Hide()
 			routeHidden = true
 		end
-		local dropdown = getglobal("pfQuestMapDropdown")
-		if dropdown and dropdown:IsShown() then
-			dropdown:Hide()
-			dropdownHidden = true
+		for _, name in ipairs(dropdowns) do
+			local dropdown = getglobal(name)
+			if dropdown and dropdown:IsShown() then
+				dropdown:Hide()
+				dropdownHidden[name] = true
+			end
 		end
 		return origShow(...)
 	end
@@ -854,10 +901,10 @@ local function DMV_ApplypfQuestCompat()
 			local layer = pfQuest and pfQuest.route and pfQuest.route.drawlayer
 			if layer then layer:Show() end
 		end
-		-- pfQuest's OnShow re-reads its tracking setting into the dropdown.
-		if dropdownHidden then
-			dropdownHidden = false
-			local dropdown = getglobal("pfQuestMapDropdown")
+		-- pfQuest's OnShow scripts refresh the dropdowns' captions and layout.
+		for name in pairs(dropdownHidden) do
+			dropdownHidden[name] = nil
+			local dropdown = getglobal(name)
 			if dropdown then dropdown:Show() end
 		end
 		if pinsHidden then
@@ -916,6 +963,7 @@ compatFrame:SetScript("OnEvent", function()
 	DMV_ApplyMMMCompat()
 	DMV_ApplypfUICompat()
 	DMV_ApplyCoordCompat()
+	DMV_ApplyShaguCoordCompat()
 	DMV_ApplypfQuestCompat()
 	DMV_ApplyQuestieCompat()
 end)
