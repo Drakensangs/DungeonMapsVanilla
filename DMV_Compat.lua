@@ -22,6 +22,7 @@ end
 
 local function DMV_NeedsWindowFallback()
 	if pfUI and pfUI.map then return false end
+	if S_WorldMap then return false end
 	return not (ShaguTweaks and ShaguTweaks.WorldMapWindowActive == true)
 end
 
